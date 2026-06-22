@@ -143,17 +143,42 @@ def _flatten_single_dir(extract_dir):
 
 
 def _launch_replacer(src, install_dir, tmp_root):
-    """PowerShell ヘルパーを起動：本体終了待ち → 上書き → 再起動。"""
+    """PowerShell ヘルパーを起動：本体終了待ち → 上書き(リトライ) → 再起動。
+
+    配布版(onefile)は終了直後も一瞬 exe がロックされるため、解放されるまで
+    リトライしながら上書きする。ヘルパーは本体のジョブから離脱させて、本体終了で
+    巻き込み終了しないようにする。経過は %APPDATA%\\給与自動計算\\update_log.txt に記録。
+    """
     exe = os.path.basename(sys.executable)
     pid = os.getpid()
+    log_path = os.path.join(app_paths.data_dir(), "update_log.txt")
     ps_path = os.path.join(tmp_root, "apply_update.ps1")
-    script = f"""$ErrorActionPreference = 'SilentlyContinue'
-try {{ Wait-Process -Id {pid} -Timeout 60 }} catch {{}}
-Start-Sleep -Milliseconds 800
-Copy-Item -Path (Join-Path '{src}' '*') -Destination '{install_dir}' -Recurse -Force
-Start-Process -FilePath (Join-Path '{install_dir}' '{exe}')
-Start-Sleep -Seconds 2
-Remove-Item -Path '{tmp_root}' -Recurse -Force
+    script = f"""$ErrorActionPreference = 'Stop'
+$log = '{log_path}'
+function Log($m) {{ ("{{0:o}}  {{1}}" -f (Get-Date), $m) | Out-File -FilePath $log -Append -Encoding utf8 }}
+try {{
+    Log "ヘルパー開始 (本体PID={pid} の終了を待機)"
+    try {{ Wait-Process -Id {pid} -Timeout 120 }} catch {{}}
+    $dest = Join-Path '{install_dir}' '{exe}'
+    $copied = $false
+    for ($i = 0; $i -lt 60; $i++) {{
+        try {{
+            Copy-Item -Path (Join-Path '{src}' '*') -Destination '{install_dir}' -Recurse -Force
+            $copied = $true
+            Log "上書きコピー成功 (試行 $i 回目)"
+            break
+        }} catch {{
+            Start-Sleep -Milliseconds 500
+        }}
+    }}
+    if (-not $copied) {{ Log "上書き失敗: exe が解放されませんでした(60回リトライ)" }}
+    Start-Process -FilePath $dest
+    Log "再起動を実行: $dest"
+    Start-Sleep -Seconds 2
+    Remove-Item -Path '{tmp_root}' -Recurse -Force -ErrorAction SilentlyContinue
+}} catch {{
+    Log ("致命的エラー: " + $_.Exception.Message)
+}}
 """
     # PowerShell が Unicode として読めるよう BOM 付き UTF-8 で書き出す
     with open(ps_path, "w", encoding="utf-8-sig") as f:
@@ -161,10 +186,15 @@ Remove-Item -Path '{tmp_root}' -Recurse -Force
 
     DETACHED = 0x00000008          # DETACHED_PROCESS
     NEW_GROUP = 0x00000200         # CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_path],
-        creationflags=DETACHED | NEW_GROUP,
-        close_fds=True)
+    BREAKAWAY = 0x01000000         # CREATE_BREAKAWAY_FROM_JOB (本体終了で巻き込まれない)
+    args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-WindowStyle", "Hidden", "-File", ps_path]
+    try:
+        subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP | BREAKAWAY,
+                         close_fds=True)
+    except OSError:
+        # ジョブが離脱を許可しない環境ではフラグ無しで再試行
+        subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP, close_fds=True)
 
 
 # ----------------------------------------------------------- 進捗UI
