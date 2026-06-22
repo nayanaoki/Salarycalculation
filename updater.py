@@ -12,6 +12,7 @@
 """
 import os
 import re
+import ssl
 import sys
 import json
 import tempfile
@@ -25,6 +26,23 @@ import app_paths
 from version import __version__, UPDATE_URL
 
 _USER_AGENT = "PayrollApp-Updater/1.0"
+
+
+# ----------------------------------------------------------- SSL
+def _ssl_context():
+    """検証用 SSL コンテキスト。OS 証明書ストア＋certifi バンドルを併用する。
+
+    端末のルート証明書が古い/不足していても検証できるよう certifi を追加し、
+    社内プロキシ等の独自ルートは OS ストア(既定)側でカバーする。
+    どちらも欠けて CERTIFICATE_VERIFY_FAILED になる配布端末への対策。
+    """
+    ctx = ssl.create_default_context()  # OS 既定のルート証明書を読み込む
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())  # 公開ルートを補強
+    except Exception:
+        pass
+    return ctx
 
 
 # ----------------------------------------------------------- バージョン比較
@@ -41,7 +59,7 @@ def is_newer(latest, current):
 def fetch_latest(timeout=8):
     """version.json を取得して dict で返す。"""
     req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -114,7 +132,7 @@ def apply_update(parent, download_url):
 
 def _download(url, dest, on_progress):
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+    with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as r, open(dest, "wb") as f:
         total = int(r.headers.get("Content-Length", 0) or 0)
         read = 0
         while True:
