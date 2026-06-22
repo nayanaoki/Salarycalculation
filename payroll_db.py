@@ -30,10 +30,13 @@ DEFAULT_MAPPING = {
 }
 
 DEFAULT_SETTINGS = {
-    "rate_training": "1100",   # 研修時給
-    "rate_living": "1200",     # 生活時給
-    "rate_body": "1500",       # 身体時給
-    "kotsu_unit": "100",       # 交通費 1件単価
+    "rate_training": "1100",        # 研修時給
+    "rate_living": "1200",          # 生活時給
+    "rate_body": "1500",            # 身体時給
+    "kotsu_unit": "100",            # 交通費 1件単価
+    "rate_kaizen_living": "0",      # 処遇改善手当 (生活/時間)
+    "rate_kaizen_body": "0",        # 処遇改善手当 (身体/時間)
+    "default_shikaku": "0",         # 資格手当 初期値 (各人で編集可能)
 }
 
 
@@ -41,6 +44,14 @@ def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _add_missing_columns(cursor, table, columns):
+    """既存テーブルに不足している列を追加する(後方互換のためのマイグレーション)。"""
+    existing = {r[1] for r in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, coltype in columns.items():
+        if name not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}")
 
 
 def init_db():
@@ -58,7 +69,14 @@ def init_db():
         rate_training REAL, rate_living REAL, rate_body REAL,
         amt_training INTEGER, amt_living INTEGER, amt_body INTEGER,
         kotsu INTEGER, shikaku INTEGER, other1 INTEGER, other2 INTEGER,
+        rate_kaizen_living REAL, rate_kaizen_body REAL, amt_kaizen INTEGER,
         total_amount INTEGER, created_at TEXT)""")
+    # 既存DBへの列追加(マイグレーション)
+    _add_missing_columns(c, "records", {
+        "rate_kaizen_living": "REAL",
+        "rate_kaizen_body": "REAL",
+        "amt_kaizen": "INTEGER",
+    })
     # 初期データ投入
     for k, v in DEFAULT_SETTINGS.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
@@ -114,7 +132,8 @@ def save_record(rec):
     cols = ["person", "period", "visits", "total_min", "body_min", "living_min",
             "training_min", "rate_training", "rate_living", "rate_body",
             "amt_training", "amt_living", "amt_body", "kotsu", "shikaku",
-            "other1", "other2", "total_amount", "created_at"]
+            "other1", "other2", "rate_kaizen_living", "rate_kaizen_body",
+            "amt_kaizen", "total_amount", "created_at"]
     conn = connect()
     conn.execute(
         f"INSERT INTO records({','.join(cols)}) VALUES({','.join('?' * len(cols))})",

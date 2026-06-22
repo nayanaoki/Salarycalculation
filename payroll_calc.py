@@ -77,17 +77,25 @@ def yen(minutes, rate):
     return int(round(minutes / 60.0 * rate))
 
 
+def calc_kaizen(res, rates):
+    """処遇改善手当 = 生活時間×(生活/時間) + 身体時間×(身体/時間)。"""
+    return (yen(res["living_min"], rates.get("kaizen_living", 0))
+            + yen(res["body_min"], rates.get("kaizen_body", 0)))
+
+
 def build_record(person, period, res, rates, kotsu_unit,
                  shikaku=0, other1=0, other2=0):
     """集計結果と各種単価から1人分の給与レコードを組み立てる。"""
     amt_training = yen(res["training_min"], rates["training"])
     amt_living = yen(res["living_min"], rates["living"])
     amt_body = yen(res["body_min"], rates["body"])
+    amt_kaizen = calc_kaizen(res, rates)
     kotsu = int(round(res["visits"] * kotsu_unit))
     shikaku = int(shikaku or 0)
     other1 = int(other1 or 0)
     other2 = int(other2 or 0)
-    total = amt_training + amt_living + amt_body + kotsu + shikaku + other1 + other2
+    total = (amt_training + amt_living + amt_body + amt_kaizen
+             + kotsu + shikaku + other1 + other2)
     return {
         "person": person, "period": period,
         "visits": res["visits"], "total_min": res["total_min"],
@@ -95,7 +103,10 @@ def build_record(person, period, res, rates, kotsu_unit,
         "training_min": res["training_min"],
         "rate_training": rates["training"], "rate_living": rates["living"],
         "rate_body": rates["body"],
+        "rate_kaizen_living": rates.get("kaizen_living", 0),
+        "rate_kaizen_body": rates.get("kaizen_body", 0),
         "amt_training": amt_training, "amt_living": amt_living, "amt_body": amt_body,
+        "amt_kaizen": amt_kaizen,
         "kotsu": kotsu, "shikaku": shikaku, "other1": other1, "other2": other2,
         "total_amount": total,
     }

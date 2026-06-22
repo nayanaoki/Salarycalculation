@@ -107,6 +107,14 @@ class App(tk.Tk):
         self.var_period = tk.StringVar(value=datetime.date.today().strftime("%Y年%m月"))
         ttk.Entry(rate, textvariable=self.var_period, width=10).grid(row=0, column=10)
 
+        # 2段目: 処遇改善手当(時間単価) と 資格手当(初期値)
+        self.var_kaizen_living = tk.StringVar(value=s["rate_kaizen_living"])
+        self.var_kaizen_body = tk.StringVar(value=s["rate_kaizen_body"])
+        self.var_shikaku_default = tk.StringVar(value=s["default_shikaku"])
+        self._rate_in(rate, "処遇改善(生活/時)", self.var_kaizen_living, 0, row=1)
+        self._rate_in(rate, "処遇改善(身体/時)", self.var_kaizen_body, 1, row=1)
+        self._rate_in(rate, "資格手当(初期値)", self.var_shikaku_default, 2, row=1)
+
         bar = ttk.Frame(t)
         bar.pack(fill="x", pady=4)
         ttk.Button(bar, text="計算する", command=self.calculate).pack(side="left")
@@ -118,10 +126,12 @@ class App(tk.Tk):
         self.calc_status = ttk.Label(t, text="Excelを選択してください。", foreground="#060")
         self.calc_status.pack(fill="x")
 
-    def _rate_in(self, parent, label, var, col):
-        ttk.Label(parent, text=label).grid(row=0, column=col * 2, sticky="e", padx=(8, 2))
+    def _rate_in(self, parent, label, var, col, row=0):
+        pady = (8, 0) if row else 0
+        ttk.Label(parent, text=label).grid(row=row, column=col * 2, sticky="e",
+                                           padx=(8, 2), pady=pady)
         e = ttk.Entry(parent, textvariable=var, width=7, justify="right")
-        e.grid(row=0, column=col * 2 + 1, sticky="w")
+        e.grid(row=row, column=col * 2 + 1, sticky="w", pady=pady)
         e.bind("<Return>", lambda _e: self.calculate())
 
     def open_file(self):
@@ -141,7 +151,9 @@ class App(tk.Tk):
     def _rates(self):
         return {"training": float(parse_int(self.var_train.get())),
                 "living": float(parse_int(self.var_living.get())),
-                "body": float(parse_int(self.var_body.get()))}
+                "body": float(parse_int(self.var_body.get())),
+                "kaizen_living": float(parse_int(self.var_kaizen_living.get())),
+                "kaizen_body": float(parse_int(self.var_kaizen_body.get()))}
 
     def calculate(self):
         if self.workbook is None:
@@ -202,26 +214,28 @@ class App(tk.Tk):
         amt_t = calc.yen(res["training_min"], rates["training"])
         amt_l = calc.yen(res["living_min"], rates["living"])
         amt_b = calc.yen(res["body_min"], rates["body"])
+        amt_k = calc.calc_kaizen(res, rates)
         kotsu = res["visits"] * kotsu_unit
-        st.update(amt_t=amt_t, amt_l=amt_l, amt_b=amt_b, kotsu=kotsu)
+        st.update(amt_t=amt_t, amt_l=amt_l, amt_b=amt_b, amt_k=amt_k, kotsu=kotsu)
 
         disp(1, "研修時給", res["training_min"], amt_t)
         disp(2, "生活時給", res["living_min"], amt_l)
         disp(3, "身体時給", res["body_min"], amt_b)
-        disp(4, f"交通費 ({res['visits']}件×{kotsu_unit}円)", None, kotsu)
+        disp(4, "処遇改善手当", None, amt_k)
+        disp(5, f"交通費 ({res['visits']}件×{kotsu_unit}円)", None, kotsu)
 
-        # 編集可能項目
-        st["var_shikaku"] = tk.StringVar(value="0")
+        # 編集可能項目 (資格手当は設定の初期値をプリセット)
+        st["var_shikaku"] = tk.StringVar(value=str(parse_int(self.var_shikaku_default.get())))
         st["var_other1"] = tk.StringVar(value="0")
         st["var_other2"] = tk.StringVar(value="0")
-        self._edit_row(pay, 5, "資格手当", st["var_shikaku"], person)
-        self._edit_row(pay, 6, "その他", st["var_other1"], person)
-        self._edit_row(pay, 7, "その他2", st["var_other2"], person)
+        self._edit_row(pay, 6, "資格手当", st["var_shikaku"], person)
+        self._edit_row(pay, 7, "その他", st["var_other1"], person)
+        self._edit_row(pay, 8, "その他2", st["var_other2"], person)
 
-        ttk.Separator(pay, orient="horizontal").grid(row=8, column=0, columnspan=3, sticky="ew", pady=6)
-        ttk.Label(pay, text="合計支給額", font=("Meiryo UI", 13, "bold")).grid(row=9, column=0, sticky="w", padx=10)
+        ttk.Separator(pay, orient="horizontal").grid(row=9, column=0, columnspan=3, sticky="ew", pady=6)
+        ttk.Label(pay, text="合計支給額", font=("Meiryo UI", 13, "bold")).grid(row=10, column=0, sticky="w", padx=10)
         st["lbl_total"] = ttk.Label(pay, text="", font=("Meiryo UI", 13, "bold"), foreground="#003366")
-        st["lbl_total"].grid(row=9, column=2, sticky="e", padx=10)
+        st["lbl_total"].grid(row=10, column=2, sticky="e", padx=10)
 
         btns = ttk.Frame(frame)
         btns.pack(fill="x")
@@ -242,7 +256,8 @@ class App(tk.Tk):
         shikaku = parse_int(st["var_shikaku"].get())
         other1 = parse_int(st["var_other1"].get())
         other2 = parse_int(st["var_other2"].get())
-        total = st["amt_t"] + st["amt_l"] + st["amt_b"] + st["kotsu"] + shikaku + other1 + other2
+        total = (st["amt_t"] + st["amt_l"] + st["amt_b"] + st["amt_k"]
+                 + st["kotsu"] + shikaku + other1 + other2)
         st["lbl_total"].config(text=f"{total:,} 円")
 
     def _record_from_tab(self, person):
@@ -387,7 +402,7 @@ class App(tk.Tk):
         tot = dict(visits=0, total_min=0, amt_training=0, amt_living=0,
                    amt_body=0, kotsu=0, total_amount=0)
         for r in recs:
-            extra = r["shikaku"] + r["other1"] + r["other2"]
+            extra = r["shikaku"] + r["other1"] + r["other2"] + (r["amt_kaizen"] or 0)
             self.tot_tree.insert("", "end", values=(
                 r["person"], f"{r['visits']}件", f"{r['total_min']/60:.2f}h",
                 f"{r['amt_training']:,}", f"{r['amt_living']:,}", f"{r['amt_body']:,}",
@@ -506,7 +521,10 @@ class App(tk.Tk):
         fr.pack(anchor="w")
         self.set_vars = {}
         items = [("rate_training", "研修時給 (円)"), ("rate_living", "生活時給 (円)"),
-                 ("rate_body", "身体時給 (円)"), ("kotsu_unit", "交通費 1件単価 (円)")]
+                 ("rate_body", "身体時給 (円)"), ("kotsu_unit", "交通費 1件単価 (円)"),
+                 ("rate_kaizen_living", "処遇改善手当 (生活/時間)"),
+                 ("rate_kaizen_body", "処遇改善手当 (身体/時間)"),
+                 ("default_shikaku", "資格手当 初期値 (編集可能)")]
         for i, (key, label) in enumerate(items):
             ttk.Label(fr, text=label, width=20, anchor="w").grid(row=i, column=0, sticky="w", pady=4)
             v = tk.StringVar(value=s[key])
@@ -535,6 +553,9 @@ class App(tk.Tk):
         self.var_living.set(d["rate_living"])
         self.var_body.set(d["rate_body"])
         self.var_kotsu.set(d["kotsu_unit"])
+        self.var_kaizen_living.set(d["rate_kaizen_living"])
+        self.var_kaizen_body.set(d["rate_kaizen_body"])
+        self.var_shikaku_default.set(d["default_shikaku"])
         self.set_status.config(text="設定を保存しました。", foreground="#060")
 
     # ============================================================ 共通

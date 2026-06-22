@@ -54,10 +54,14 @@ def export_record_pdf(rec, path):
     c.drawString(x, y, "■ 給与")
     y -= 9 * mm
 
+    rk_living = rec.get("rate_kaizen_living") or 0
+    rk_body = rec.get("rate_kaizen_body") or 0
+    amt_kaizen = rec.get("amt_kaizen") or 0
     rows = [
         ("研修時給", _hm(rec["training_min"]), f"@{rec['rate_training']:.0f}", rec["amt_training"]),
         ("生活時給", _hm(rec["living_min"]), f"@{rec['rate_living']:.0f}", rec["amt_living"]),
         ("身体時給", _hm(rec["body_min"]), f"@{rec['rate_body']:.0f}", rec["amt_body"]),
+        ("処遇改善手当", "", f"生@{rk_living:.0f}/身@{rk_body:.0f}", amt_kaizen),
         ("交通費", f"{rec['visits']}件", "", rec["kotsu"]),
         ("資格手当", "", "", rec["shikaku"]),
         ("その他", "", "", rec["other1"]),
