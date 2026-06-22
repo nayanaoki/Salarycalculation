@@ -5,7 +5,7 @@
 ; インストール先(LocalAppData\Programs)は書込可能なため、アプリの自動更新が機能する。
 
 #define AppName "給与自動計算"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppExe "給与自動計算.exe"
 #define Publisher "給与自動計算"
 

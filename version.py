@@ -4,7 +4,7 @@
 リリースのたびに __version__ を上げ、配信側の version.json も同じ番号に更新する。
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 APP_NAME = "給与自動計算"
 
