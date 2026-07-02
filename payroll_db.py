@@ -36,7 +36,7 @@ DEFAULT_SETTINGS = {
     "kotsu_unit": "100",            # 交通費 1件単価
     "rate_kaizen_living": "0",      # 処遇改善手当 (生活/時間)
     "rate_kaizen_body": "0",        # 処遇改善手当 (身体/時間)
-    "default_shikaku": "0",         # 資格手当 初期値 (各人で編集可能)
+    "default_shikaku": "0",         # 資格手当 初期値 (1時間あたりの支給額・各人で編集可能)
 }
 
 
@@ -68,7 +68,8 @@ def init_db():
         body_min INTEGER, living_min INTEGER, training_min INTEGER,
         rate_training REAL, rate_living REAL, rate_body REAL,
         amt_training INTEGER, amt_living INTEGER, amt_body INTEGER,
-        kotsu INTEGER, shikaku INTEGER, other1 INTEGER, other2 INTEGER,
+        kotsu INTEGER, shikaku INTEGER, rate_shikaku REAL,
+        other1 INTEGER, other2 INTEGER,
         rate_kaizen_living REAL, rate_kaizen_body REAL, amt_kaizen INTEGER,
         total_amount INTEGER, created_at TEXT)""")
     # 既存DBへの列追加(マイグレーション)
@@ -76,6 +77,7 @@ def init_db():
         "rate_kaizen_living": "REAL",
         "rate_kaizen_body": "REAL",
         "amt_kaizen": "INTEGER",
+        "rate_shikaku": "REAL",
     })
     # 初期データ投入
     for k, v in DEFAULT_SETTINGS.items():
@@ -132,7 +134,7 @@ def save_record(rec):
     cols = ["person", "period", "visits", "total_min", "body_min", "living_min",
             "training_min", "rate_training", "rate_living", "rate_body",
             "amt_training", "amt_living", "amt_body", "kotsu", "shikaku",
-            "other1", "other2", "rate_kaizen_living", "rate_kaizen_body",
+            "rate_shikaku", "other1", "other2", "rate_kaizen_living", "rate_kaizen_body",
             "amt_kaizen", "total_amount", "created_at"]
     conn = connect()
     conn.execute(

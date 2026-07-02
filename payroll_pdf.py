@@ -63,7 +63,7 @@ def export_record_pdf(rec, path):
         ("身体時給", _hm(rec["body_min"]), f"@{rec['rate_body']:.0f}", rec["amt_body"]),
         ("処遇改善手当", "", f"生@{rk_living:.0f}/身@{rk_body:.0f}", amt_kaizen),
         ("交通費", f"{rec['visits']}件", "", rec["kotsu"]),
-        ("資格手当", "", "", rec["shikaku"]),
+        ("資格手当", "", f"@{rec.get('rate_shikaku') or 0:.0f}", rec["shikaku"]),
         ("その他", "", "", rec["other1"]),
         ("その他2", "", "", rec["other2"]),
     ]

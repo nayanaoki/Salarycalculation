@@ -107,13 +107,13 @@ class App(tk.Tk):
         self.var_period = tk.StringVar(value=datetime.date.today().strftime("%Y年%m月"))
         ttk.Entry(rate, textvariable=self.var_period, width=10).grid(row=0, column=10)
 
-        # 2段目: 処遇改善手当(時間単価) と 資格手当(初期値)
+        # 2段目: 処遇改善手当(時間単価) と 資格手当(円/時・初期値)
         self.var_kaizen_living = tk.StringVar(value=s["rate_kaizen_living"])
         self.var_kaizen_body = tk.StringVar(value=s["rate_kaizen_body"])
         self.var_shikaku_default = tk.StringVar(value=s["default_shikaku"])
         self._rate_in(rate, "処遇改善(生活/時)", self.var_kaizen_living, 0, row=1)
         self._rate_in(rate, "処遇改善(身体/時)", self.var_kaizen_body, 1, row=1)
-        self._rate_in(rate, "資格手当(初期値)", self.var_shikaku_default, 2, row=1)
+        self._rate_in(rate, "資格手当(円/時)", self.var_shikaku_default, 2, row=1)
 
         bar = ttk.Frame(t)
         bar.pack(fill="x", pady=4)
@@ -224,11 +224,11 @@ class App(tk.Tk):
         disp(4, "処遇改善手当", None, amt_k)
         disp(5, f"交通費 ({res['visits']}件×{kotsu_unit}円)", None, kotsu)
 
-        # 編集可能項目 (資格手当は設定の初期値をプリセット)
+        # 編集可能項目 (資格手当は設定の初期値=1時間あたり支給額をプリセット)
         st["var_shikaku"] = tk.StringVar(value=str(parse_int(self.var_shikaku_default.get())))
         st["var_other1"] = tk.StringVar(value="0")
         st["var_other2"] = tk.StringVar(value="0")
-        self._edit_row(pay, 6, "資格手当", st["var_shikaku"], person)
+        self._shikaku_row(pay, 6, person)
         self._edit_row(pay, 7, "その他", st["var_other1"], person)
         self._edit_row(pay, 8, "その他2", st["var_other2"], person)
 
@@ -251,9 +251,26 @@ class App(tk.Tk):
         e.grid(row=r, column=2, sticky="e", padx=10)
         var.trace_add("write", lambda *_a, p=person: self._update_total(p))
 
+    def _shikaku_row(self, pay, r, person):
+        """資格手当行: 円/時を入力→稼働時間に応じて金額を自動計算・表示。"""
+        st = self.person_tabs[person]
+        ttk.Label(pay, text="資格手当", width=12, anchor="w").grid(
+            row=r, column=0, sticky="w", padx=10, pady=2)
+        rate_frame = ttk.Frame(pay)
+        rate_frame.grid(row=r, column=1, sticky="e", padx=10)
+        ttk.Entry(rate_frame, textvariable=st["var_shikaku"], width=6,
+                  justify="right").pack(side="left")
+        ttk.Label(rate_frame, text="円/時").pack(side="left")
+        st["lbl_shikaku"] = ttk.Label(pay, text="0 円", anchor="e", width=14)
+        st["lbl_shikaku"].grid(row=r, column=2, sticky="e", padx=10)
+        st["var_shikaku"].trace_add("write", lambda *_a, p=person: self._update_total(p))
+
     def _update_total(self, person):
         st = self.person_tabs[person]
-        shikaku = parse_int(st["var_shikaku"].get())
+        shikaku = calc.calc_shikaku(st["res"], parse_int(st["var_shikaku"].get()))
+        st["amt_shikaku"] = shikaku
+        if "lbl_shikaku" in st:
+            st["lbl_shikaku"].config(text=f"{shikaku:,} 円")
         other1 = parse_int(st["var_other1"].get())
         other2 = parse_int(st["var_other2"].get())
         total = (st["amt_t"] + st["amt_l"] + st["amt_b"] + st["amt_k"]
@@ -264,7 +281,7 @@ class App(tk.Tk):
         st = self.person_tabs[person]
         rec = calc.build_record(
             person, self.var_period.get(), st["res"], st["rates"], st["kotsu_unit"],
-            shikaku=parse_int(st["var_shikaku"].get()),
+            shikaku_rate=parse_int(st["var_shikaku"].get()),
             other1=parse_int(st["var_other1"].get()),
             other2=parse_int(st["var_other2"].get()))
         return rec
@@ -524,7 +541,7 @@ class App(tk.Tk):
                  ("rate_body", "身体時給 (円)"), ("kotsu_unit", "交通費 1件単価 (円)"),
                  ("rate_kaizen_living", "処遇改善手当 (生活/時間)"),
                  ("rate_kaizen_body", "処遇改善手当 (身体/時間)"),
-                 ("default_shikaku", "資格手当 初期値 (編集可能)")]
+                 ("default_shikaku", "資格手当 初期値 (円/時)")]
         for i, (key, label) in enumerate(items):
             ttk.Label(fr, text=label, width=20, anchor="w").grid(row=i, column=0, sticky="w", pady=4)
             v = tk.StringVar(value=s[key])
