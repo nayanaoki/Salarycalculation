@@ -84,8 +84,12 @@ def calc_kaizen(res, rates):
 
 
 def calc_shikaku(res, shikaku_rate):
-    """資格手当 = 合計勤務時間 × 1時間あたりの支給額(四捨五入)。"""
-    return yen(res["total_min"], float(shikaku_rate or 0))
+    """資格手当 = (身体+生活)時間 × 1時間あたりの支給額(四捨五入)。
+
+    研修時給が適用される時間(同行)は資格手当の対象外とするため、
+    total_min ではなく body_min + living_min で計算する。
+    """
+    return yen(res["body_min"] + res["living_min"], float(shikaku_rate or 0))
 
 
 def build_record(person, period, res, rates, kotsu_unit,
