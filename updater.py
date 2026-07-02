@@ -202,17 +202,22 @@ try {{
     with open(ps_path, "w", encoding="utf-8-sig") as f:
         f.write(script)
 
-    DETACHED = 0x00000008          # DETACHED_PROCESS
+    # 【重要】DETACHED_PROCESS(0x00000008) は使わない。配布版(onefile)から
+    # DETACHED_PROCESS で powershell を起動すると、環境によってはヘルパーが
+    # まったく起動・実行されず(ログの1行目すら書かれない)、exe が置換されない
+    # まま本体だけ終了する不具合が出る。窓を出さずに確実に動く CREATE_NO_WINDOW
+    # を使う(コンソールは持つが非表示)。BREAKAWAY で本体終了に巻き込まれない。
+    NO_WINDOW = 0x08000000         # CREATE_NO_WINDOW (窓を出さずコンソールは持つ)
     NEW_GROUP = 0x00000200         # CREATE_NEW_PROCESS_GROUP
     BREAKAWAY = 0x01000000         # CREATE_BREAKAWAY_FROM_JOB (本体終了で巻き込まれない)
     args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-WindowStyle", "Hidden", "-File", ps_path]
     try:
-        subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP | BREAKAWAY,
+        subprocess.Popen(args, creationflags=NO_WINDOW | NEW_GROUP | BREAKAWAY,
                          close_fds=True)
     except OSError:
         # ジョブが離脱を許可しない環境ではフラグ無しで再試行
-        subprocess.Popen(args, creationflags=DETACHED | NEW_GROUP, close_fds=True)
+        subprocess.Popen(args, creationflags=NO_WINDOW | NEW_GROUP, close_fds=True)
 
 
 # ----------------------------------------------------------- 進捗UI
