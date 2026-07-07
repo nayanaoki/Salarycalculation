@@ -7,19 +7,33 @@ COL_DATE, COL_DOW, COL_START, COL_END, COL_DUR, COL_USER, COL_KUBUN, COL_SERVICE
 HEADER_ROWS = 2
 
 
+def _to_minutes_of_day(cell):
+    """時刻セルを 0時からの分に変換。datetime.time / 'H:MM' 文字列に対応。"""
+    if cell is None:
+        return None
+    hour = getattr(cell, "hour", None)
+    if hour is not None:
+        return hour * 60 + getattr(cell, "minute", 0)
+    m = re.match(r"\s*(\d{1,2})\s*[:：]\s*(\d{1,2})", str(cell))
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    return None
+
+
 def parse_minutes(dur_cell, start_cell, end_cell):
-    """列E(例 '75分')から分。無ければ開始/終了から算出。"""
-    if dur_cell is not None:
+    """列E(例 '75分')から分。無ければ開始/終了から算出。
+
+    Excel読込では時刻は datetime.time、貼り付けでは 'H:MM' 文字列になるため
+    どちらでも算出できるようにする。
+    """
+    if dur_cell is not None and str(dur_cell).strip() != "":
         m = re.search(r"(\d+)", str(dur_cell))
         if m:
             return int(m.group(1))
-    try:
-        s = start_cell.hour * 60 + start_cell.minute
-        e = end_cell.hour * 60 + end_cell.minute
-        if e >= s:
-            return e - s
-    except AttributeError:
-        pass
+    s = _to_minutes_of_day(start_cell)
+    e = _to_minutes_of_day(end_cell)
+    if s is not None and e is not None and e >= s:
+        return e - s
     return 0
 
 
@@ -32,13 +46,27 @@ def is_plain_body(service):
     return bool(re.match(r"^身体(?![0-9０-９])", service))
 
 
+def sheet_rows(ws):
+    """1シートから見出し行を除いたデータ行(タプルの並び)を返す。"""
+    return list(ws.iter_rows(values_only=True))[HEADER_ROWS:]
+
+
 def calc_sheet(ws, mapping):
     """1シート(=人物1人)を集計。mapping: {service:(body,living)}"""
+    return calc_rows(sheet_rows(ws), mapping)
+
+
+def calc_rows(rows, mapping):
+    """行タプルの並び(=人物1人)を集計。mapping: {service:(body,living)}
+
+    rows は各要素が少なくとも COL_SERVICE(8列)まで持つタプル/リスト。
+    Excelシート・貼り付けデータのどちらからでも同じロジックで集計する。
+    """
     body_min = living_min = training_min = 0
     visits = 0
     errors = []
-    for row in list(ws.iter_rows(values_only=True))[HEADER_ROWS:]:
-        if not row or row[COL_DATE] in (None, ""):
+    for row in rows:
+        if not row or len(row) <= COL_SERVICE or row[COL_DATE] in (None, ""):
             continue
         kubun = row[COL_KUBUN] or ""
         service = row[COL_SERVICE] or ""
@@ -70,6 +98,64 @@ def calc_sheet(ws, mapping):
         "total_min": body_min + living_min + training_min,
         "errors": errors,
     }
+
+
+def row_detail(row, mapping):
+    """1行を労働記録(勤務実績)出力用に分解する。空行なら None。
+
+    戻り: dict(date,dow,user,service,start,end,minutes,body,living,training,error)
+    区分・内容の判定は calc_rows と同じ（同行→研修/家事→生活/番号なし身体→身体/
+    対応表→固定分数/それ以外→error）。
+    """
+    if not row or len(row) <= COL_SERVICE or row[COL_DATE] in (None, ""):
+        return None
+    kubun = row[COL_KUBUN] or ""
+    service = row[COL_SERVICE] or ""
+    if isinstance(kubun, str):
+        kubun = kubun.strip()
+    if isinstance(service, str):
+        service = service.strip()
+    minutes = parse_minutes(row[COL_DUR], row[COL_START], row[COL_END])
+    body = living = training = 0
+    error = False
+    if kubun == "同行":
+        training = minutes
+    elif service == "家事":
+        living = minutes
+    elif is_plain_body(service):
+        body = minutes
+    elif service in mapping:
+        body, living = mapping[service]
+    else:
+        error = True
+    return {
+        "date": row[COL_DATE], "dow": row[COL_DOW], "user": row[COL_USER],
+        "service": service, "start": row[COL_START], "end": row[COL_END],
+        "minutes": minutes, "body": body, "living": living,
+        "training": training, "error": error,
+    }
+
+
+def parse_pasted(text):
+    """Excelから貼り付けたタブ区切りテキストを行タプルの並びに変換。
+
+    見出し行(実施日など日付でない行)や空行は自動的に読み飛ばす。
+    A実施日 B曜日 C開始 D終了 E時間 F利用者名 G区分 H内容 の並びを想定。
+    """
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        cells = line.split("\t")
+        # 8列に満たない貼り付けにも耐えるようパディング
+        if len(cells) < COL_SERVICE + 1:
+            cells = cells + [""] * (COL_SERVICE + 1 - len(cells))
+        cells = [c.strip() for c in cells]
+        # 実施日に数字が無い行(見出し・注記など)は読み飛ばす
+        if not re.search(r"\d", cells[COL_DATE] or ""):
+            continue
+        rows.append(tuple(cells))
+    return rows
 
 
 def yen(minutes, rate):

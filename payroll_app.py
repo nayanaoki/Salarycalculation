@@ -28,6 +28,7 @@ except ImportError as ex:
 import payroll_db as db
 import payroll_calc as calc
 import payroll_pdf as pdf
+import theme
 import updater
 from version import __version__
 
@@ -47,28 +48,33 @@ class App(tk.Tk):
         super().__init__()
         db.init_db()
         self.title(f"給与自動計算 システム  v{__version__}")
-        self.geometry("900x680")
+        self.geometry("960x700")
         self.option_add("*Font", FONT)
+        theme.apply(self)   # ライト系テックのテーマを適用
 
         self.workbook = None
         self.person_tabs = {}   # person -> dict(state)
+        self._tab_outer = {}    # inner frame -> outer(tab) frame
+
+        self._build_header()
 
         nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True)
+        nb.pack(fill="both", expand=True, padx=10, pady=(6, 10))
         self.main_nb = nb
 
-        self.tab_calc = ttk.Frame(nb, padding=8)
-        self.tab_records = ttk.Frame(nb, padding=8)
-        self.tab_totals = ttk.Frame(nb, padding=8)
-        self.tab_mapping = ttk.Frame(nb, padding=8)
-        self.tab_settings = ttk.Frame(nb, padding=8)
-        nb.add(self.tab_calc, text="給与計算")
-        nb.add(self.tab_records, text="計算記録")
-        nb.add(self.tab_totals, text="全員総計")
-        nb.add(self.tab_mapping, text="対応表編集")
-        nb.add(self.tab_settings, text="その他項目設定")
+        # 各タブは縦横スクロール可能な内側フレーム。ウィンドウが小さくても
+        # 内容が見切れずスクロールで参照できる。
+        self.tab_employees = self._scrollable_tab(nb, "従業員管理")
+        self.tab_calc = self._scrollable_tab(nb, "給与計算")
+        self.tab_workdata = self._scrollable_tab(nb, "労働記録")
+        self.tab_records = self._scrollable_tab(nb, "計算記録")
+        self.tab_totals = self._scrollable_tab(nb, "全員総計")
+        self.tab_mapping = self._scrollable_tab(nb, "対応表編集")
+        self.tab_settings = self._scrollable_tab(nb, "その他項目設定")
 
+        self._build_employees()
         self._build_calc()
+        self._build_workdata()
         self._build_records()
         self._build_totals()
         self._build_mapping()
@@ -78,6 +84,169 @@ class App(tk.Tk):
 
         # 起動時に最新版を確認（更新がある時だけ通知）
         self.after(1000, lambda: updater.check_for_updates(self, silent=True))
+
+    # ============================================================ ヘッダー
+    def _build_header(self):
+        """上部の濃紺ヘッダーバー（アクセント＋タイトル＋バージョン）。"""
+        header = tk.Frame(self, bg=theme.HEADER_BG, height=46)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+        tk.Frame(header, bg=theme.ACCENT, width=6).pack(side="left", fill="y")
+        tk.Label(header, text="給与自動計算 システム", bg=theme.HEADER_BG,
+                 fg=theme.HEADER_FG, font=("Meiryo UI", 14, "bold")).pack(
+            side="left", padx=14)
+        tk.Label(header, text=f"v{__version__}", bg=theme.HEADER_BG,
+                 fg=theme.HEADER_SUB, font=("Meiryo UI", 10)).pack(
+            side="right", padx=16)
+
+    # ============================================================ スクロール枠
+    def _scrollable_tab(self, nb, text):
+        """縦横スクロール可能な内側フレームを持つタブを追加し、内側を返す。"""
+        outer = ttk.Frame(nb)
+        nb.add(outer, text=text)
+        canvas = tk.Canvas(outer, highlightthickness=0, bg=theme.SURFACE)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        hsb = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas, padding=8)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner(_e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner)
+
+        def _on_canvas(e):
+            # 内容がキャンバスより小さいときは幅を合わせて余白を無くす
+            canvas.itemconfigure(win, width=max(e.width, inner.winfo_reqwidth()))
+        canvas.bind("<Configure>", _on_canvas)
+
+        # マウスホイールはカーソルが乗っているキャンバスに対して効かせる
+        def _wheel(e):
+            canvas.yview_scroll(int(-e.delta / 120), "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        self._tab_outer[inner] = outer
+        return inner
+
+    def _select_tab(self, inner):
+        self.main_nb.select(self._tab_outer[inner])
+
+    # ============================================================ 従業員管理
+    def _build_employees(self):
+        t = self.tab_employees
+        ttk.Label(t, text="従業員の登録・編集", font=FONT_B).pack(anchor="w")
+        ttk.Label(t, text="※氏名は勤務実績のシート名(または貼り付け時の氏名)と一致させると、"
+                          "資格に応じた資格手当が自動で適用されます。",
+                  foreground="#666").pack(anchor="w", pady=(0, 6))
+
+        cols = ("id", "mgmt_no", "name", "qualification")
+        heads = {"id": "ID", "mgmt_no": "管理番号", "name": "氏名", "qualification": "資格"}
+        widths = {"id": 40, "mgmt_no": 120, "name": 200, "qualification": 140}
+        tv = ttk.Treeview(t, columns=cols, show="headings", height=13)
+        for cn in cols:
+            tv.heading(cn, text=heads[cn])
+            tv.column(cn, width=widths[cn],
+                      anchor="w" if cn in ("mgmt_no", "name", "qualification") else "center")
+        tv.pack(fill="both", expand=True, pady=6)
+        tv.bind("<<TreeviewSelect>>", self._emp_on_select)
+        self.emp_tree = tv
+
+        form = ttk.LabelFrame(t, text="入力", padding=8)
+        form.pack(fill="x", pady=4)
+        ttk.Label(form, text="管理番号").grid(row=0, column=0, sticky="e", padx=(0, 4))
+        self.emp_mgmt = tk.StringVar()
+        ttk.Entry(form, textvariable=self.emp_mgmt, width=14).grid(row=0, column=1, padx=(0, 12))
+        ttk.Label(form, text="氏名 *").grid(row=0, column=2, sticky="e", padx=(0, 4))
+        self.emp_name = tk.StringVar()
+        ttk.Entry(form, textvariable=self.emp_name, width=18).grid(row=0, column=3, padx=(0, 12))
+        ttk.Label(form, text="資格 *").grid(row=0, column=4, sticky="e", padx=(0, 4))
+        self.emp_qual = tk.StringVar()
+        ttk.Combobox(form, textvariable=self.emp_qual, values=db.QUALIFICATIONS,
+                     width=12, state="readonly").grid(row=0, column=5)
+
+        bar = ttk.Frame(t)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="新規追加", command=self._emp_add,
+                   style="Accent.TButton").pack(side="left")
+        ttk.Button(bar, text="選択を更新", command=self._emp_update).pack(side="left", padx=6)
+        ttk.Button(bar, text="選択を削除", command=self._emp_delete).pack(side="left")
+        ttk.Button(bar, text="入力をクリア", command=self._emp_clear).pack(side="left", padx=6)
+        self.emp_status = ttk.Label(t, text="", foreground="#060")
+        self.emp_status.pack(anchor="w", pady=4)
+        self._refresh_employees()
+
+    def _refresh_employees(self):
+        self.emp_tree.delete(*self.emp_tree.get_children())
+        for e in db.list_employees():
+            self.emp_tree.insert("", "end", values=(
+                e["id"], e["mgmt_no"] or "", e["name"], e["qualification"] or ""))
+
+    def _emp_on_select(self, _e=None):
+        sel = self.emp_tree.selection()
+        if not sel:
+            return
+        _id, mgmt, name, qual = self.emp_tree.item(sel[0])["values"]
+        self.emp_mgmt.set(mgmt)
+        self.emp_name.set(name)
+        self.emp_qual.set(qual)
+
+    def _emp_form_values(self):
+        name = self.emp_name.get().strip()
+        qual = self.emp_qual.get().strip()
+        if not name:
+            messagebox.showwarning("入力不足", "氏名は必須です。")
+            return None
+        if not qual:
+            messagebox.showwarning("入力不足", "資格を選択してください。")
+            return None
+        return self.emp_mgmt.get().strip(), name, qual
+
+    def _emp_add(self):
+        v = self._emp_form_values()
+        if not v:
+            return
+        db.add_employee(*v)
+        self._refresh_employees()
+        self._refresh_paste_employees()
+        self._emp_clear()
+        self.emp_status.config(text="従業員を追加しました。", foreground="#060")
+
+    def _emp_update(self):
+        sel = self.emp_tree.selection()
+        if not sel:
+            messagebox.showinfo("選択なし", "更新する従業員を一覧から選択してください。")
+            return
+        v = self._emp_form_values()
+        if not v:
+            return
+        eid = int(self.emp_tree.item(sel[0])["values"][0])
+        db.update_employee(eid, *v)
+        self._refresh_employees()
+        self._refresh_paste_employees()
+        self.emp_status.config(text="従業員情報を更新しました。", foreground="#060")
+
+    def _emp_delete(self):
+        sel = self.emp_tree.selection()
+        if not sel:
+            messagebox.showinfo("選択なし", "削除する従業員を選択してください。")
+            return
+        eid = int(self.emp_tree.item(sel[0])["values"][0])
+        if messagebox.askyesno("確認", "選択した従業員を削除しますか？"):
+            db.delete_employee(eid)
+            self._refresh_employees()
+            self._refresh_paste_employees()
+            self._emp_clear()
+            self.emp_status.config(text="削除しました。", foreground="#060")
+
+    def _emp_clear(self):
+        self.emp_mgmt.set("")
+        self.emp_name.set("")
+        self.emp_qual.set("")
 
     # ============================================================ 給与計算
     def _build_calc(self):
@@ -117,7 +286,10 @@ class App(tk.Tk):
 
         bar = ttk.Frame(t)
         bar.pack(fill="x", pady=4)
-        ttk.Button(bar, text="計算する", command=self.calculate).pack(side="left")
+        ttk.Button(bar, text="計算する", command=self.calculate,
+                   style="Accent.TButton").pack(side="left")
+        ttk.Button(bar, text="データを貼り付けて追加",
+                   command=self.open_paste_dialog).pack(side="left", padx=6)
         ttk.Button(bar, text="全員分を記録保存", command=self.save_all_records).pack(side="left", padx=6)
 
         self.calc_nb = ttk.Notebook(t)
@@ -169,10 +341,14 @@ class App(tk.Tk):
 
         errors = []
         for ws in self.workbook.worksheets:
-            res = calc.calc_sheet(ws, mapping)
-            self._add_person_tab(ws.title, res, rates, kotsu_unit)
+            rows = calc.sheet_rows(ws)
+            res = calc.calc_rows(rows, mapping)
+            # 読み込んだ生データをそのまま保存(person+period で upsert)
+            db.save_work_data(ws.title, self.var_period.get(), rows)
+            self._add_person_tab(ws.title, res, rates, kotsu_unit, rows=rows)
             if res["errors"]:
                 errors.append(f"[{ws.title}] {', '.join(sorted(set(res['errors'])))}")
+        self._refresh_workdata()
 
         if errors:
             self.calc_status.config(
@@ -183,11 +359,20 @@ class App(tk.Tk):
             self.calc_status.config(text="計算完了。資格手当・その他を入力後、記録保存/PDF出力できます。",
                                     foreground="#060")
 
-    def _add_person_tab(self, person, res, rates, kotsu_unit):
+    def _add_person_tab(self, person, res, rates, kotsu_unit, rows=None):
         frame = ttk.Frame(self.calc_nb, padding=10)
         self.calc_nb.add(frame, text=person)
-        st = {"person": person, "res": res, "rates": rates, "kotsu_unit": kotsu_unit}
+        st = {"person": person, "res": res, "rates": rates, "kotsu_unit": kotsu_unit,
+              "rows": rows}
         self.person_tabs[person] = st
+
+        # 従業員登録から資格を照合し、資格手当(円/時)の初期値を決める
+        emp = db.get_employee_by_name(person)
+        qual = (emp.get("qualification") if emp else None)
+        settings = db.get_settings()
+        settings["default_shikaku"] = str(parse_int(self.var_shikaku_default.get()))
+        shikaku_rate = db.shikaku_rate_for(qual, settings)
+        st["qual"] = qual
 
         # 稼働
         work = ttk.LabelFrame(frame, text="稼働に関する内容", padding=8)
@@ -196,6 +381,9 @@ class App(tk.Tk):
         ttk.Label(work, text=f"合計勤務時間:  {h}時間{m}分  ({res['total_min']/60:.2f} 時間)").grid(
             row=0, column=0, sticky="w", pady=2)
         ttk.Label(work, text=f"訪問件数:  {res['visits']} 件").grid(row=1, column=0, sticky="w")
+        qual_text = f"資格:  {qual}（資格手当 {int(round(shikaku_rate)):,} 円/時 を適用）" \
+            if qual else "資格:  従業員未登録（既定の資格手当を適用）"
+        ttk.Label(work, text=qual_text, foreground="#036").grid(row=2, column=0, sticky="w", pady=(2, 0))
 
         # 給与
         pay = ttk.LabelFrame(frame, text="給与に関する内容", padding=8)
@@ -224,8 +412,8 @@ class App(tk.Tk):
         disp(4, "処遇改善手当", None, amt_k)
         disp(5, f"交通費 ({res['visits']}件×{kotsu_unit}円)", None, kotsu)
 
-        # 編集可能項目 (資格手当は設定の初期値=1時間あたり支給額をプリセット)
-        st["var_shikaku"] = tk.StringVar(value=str(parse_int(self.var_shikaku_default.get())))
+        # 編集可能項目 (資格手当は保有資格に応じた円/時をプリセット・上書き可)
+        st["var_shikaku"] = tk.StringVar(value=str(int(round(shikaku_rate))))
         st["var_other1"] = tk.StringVar(value="0")
         st["var_other2"] = tk.StringVar(value="0")
         self._shikaku_row(pay, 6, person)
@@ -318,6 +506,252 @@ class App(tk.Tk):
         if messagebox.askyesno("完了", f"PDFを出力しました。\n{path}\n\n開きますか？"):
             os.startfile(path)
 
+    # ------------------------------------------------------------ 貼り付け入力
+    def open_paste_dialog(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("データを貼り付けて追加")
+        dlg.geometry("660x540")
+        dlg.transient(self)
+        dlg.configure(bg=theme.SURFACE)
+
+        ttk.Label(dlg, text="従業員を選択（または氏名を入力）", font=FONT_B).pack(
+            anchor="w", padx=10, pady=(10, 2))
+        row = ttk.Frame(dlg)
+        row.pack(fill="x", padx=10)
+        self._paste_name = tk.StringVar()
+        self._paste_combo = ttk.Combobox(row, textvariable=self._paste_name, width=30)
+        self._paste_combo.pack(side="left")
+        self._refresh_paste_employees()
+
+        ttk.Label(dlg, text="勤務実績の表（実施日〜内容の列）をExcelからコピーし、下欄に貼り付けてください。\n"
+                            "見出し行や空行は自動で読み飛ばします。時給・交通費単価は給与計算画面の設定を使用します。",
+                  foreground="#666").pack(anchor="w", padx=10, pady=(8, 2))
+        txt = tk.Text(dlg, height=18, width=80, bg=theme.SURFACE, fg=theme.TEXT,
+                      relief="solid", borderwidth=1, highlightthickness=1,
+                      highlightbackground=theme.BORDER, highlightcolor=theme.ACCENT,
+                      insertbackground=theme.TEXT, padx=6, pady=6)
+        txt.pack(fill="both", expand=True, padx=10, pady=4)
+        txt.focus_set()
+
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=10, pady=8)
+
+        def do_add():
+            name = self._paste_name.get().strip()
+            if not name:
+                messagebox.showwarning("入力不足", "氏名を入力または選択してください。", parent=dlg)
+                return
+            rows = calc.parse_pasted(txt.get("1.0", "end"))
+            if not rows:
+                messagebox.showwarning(
+                    "データなし", "貼り付けデータから有効な行が読み取れませんでした。", parent=dlg)
+                return
+            mapping = db.get_mapping()
+            rates = self._rates()
+            kotsu_unit = parse_int(self.var_kotsu.get())
+            res = calc.calc_rows(rows, mapping)
+            # 貼り付けた生データもそのまま保存
+            db.save_work_data(name, self.var_period.get(), rows)
+            self._remove_person_tab(name)
+            self._add_person_tab(name, res, rates, kotsu_unit, rows=rows)
+            self._refresh_workdata()
+            self.calc_nb.select(self.calc_nb.tabs()[-1])
+            msg = f"{name} を追加しました（{res['visits']}件）。"
+            color = "#060"
+            if res["errors"]:
+                msg += " 対応表外: " + ", ".join(sorted(set(res["errors"])))
+                color = "#a00"
+            self.calc_status.config(text=msg, foreground=color)
+            dlg.destroy()
+
+        ttk.Button(bar, text="この内容で追加", command=do_add,
+                   style="Accent.TButton").pack(side="left")
+        ttk.Button(bar, text="閉じる", command=dlg.destroy).pack(side="left", padx=6)
+
+    def _refresh_paste_employees(self):
+        combo = getattr(self, "_paste_combo", None)
+        if combo is None:
+            return
+        try:
+            if not combo.winfo_exists():
+                return
+            combo["values"] = [e["name"] for e in db.list_employees()]
+        except tk.TclError:
+            pass
+
+    def _remove_person_tab(self, name):
+        if name not in self.person_tabs:
+            return
+        for tab in self.calc_nb.tabs():
+            if self.calc_nb.tab(tab, "text") == name:
+                self.calc_nb.forget(tab)
+                break
+        self.person_tabs.pop(name, None)
+
+    # ============================================================ 労働記録
+    def _build_workdata(self):
+        t = self.tab_workdata
+        ttk.Label(t, text="労働記録（手動入力・貼り付けした勤務実績の保存データ）",
+                  font=FONT_B).pack(anchor="w")
+        ttk.Label(t, text="※Excel読込・貼り付けの都度、氏名＋期間ごとに自動保存されます。"
+                          "アプリを閉じても残ります。労働記録(勤務実績)Excel・個人出勤簿を出力できます。",
+                  foreground="#666").pack(anchor="w", pady=(0, 6))
+
+        cols = ("id", "person", "period", "lines", "updated_at")
+        heads = {"id": "ID", "person": "氏名", "period": "期間",
+                 "lines": "明細行数", "updated_at": "保存日時"}
+        widths = {"id": 40, "person": 140, "period": 110, "lines": 80, "updated_at": 160}
+        tv = ttk.Treeview(t, columns=cols, show="headings", height=15)
+        for cn in cols:
+            tv.heading(cn, text=heads[cn])
+            tv.column(cn, width=widths[cn],
+                      anchor="w" if cn in ("person", "period") else "center")
+        tv.pack(fill="both", expand=True, pady=6)
+        self.wd_tree = tv
+
+        bar = ttk.Frame(t)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="労働記録(勤務実績)を出力",
+                   command=self._wd_export_record,
+                   style="Accent.TButton").pack(side="left")
+        ttk.Button(bar, text="個人出勤簿をダウンロード",
+                   command=self._wd_export_attendance,
+                   style="Accent.TButton").pack(side="left", padx=6)
+        self.wd_status = ttk.Label(t, text="", foreground="#060")
+        self.wd_status.pack(anchor="w", pady=(6, 4))
+
+        bar2 = ttk.Frame(t)
+        bar2.pack(fill="x")
+        ttk.Button(bar2, text="選択を給与計算へ再読込",
+                   command=self._wd_reload_selected).pack(side="left")
+        ttk.Button(bar2, text="すべて再読込",
+                   command=self._wd_reload_all).pack(side="left", padx=6)
+        ttk.Button(bar2, text="選択を削除", command=self._wd_delete).pack(side="left")
+        ttk.Button(bar2, text="再表示", command=self._refresh_workdata).pack(side="left", padx=6)
+        self._refresh_workdata()
+
+    def _refresh_workdata(self):
+        if not hasattr(self, "wd_tree"):
+            return
+        self.wd_tree.delete(*self.wd_tree.get_children())
+        for d in db.list_work_data():
+            self.wd_tree.insert("", "end", values=(
+                d["id"], d["person"], d["period"] or "", f"{len(d['rows'])}行",
+                d["updated_at"]))
+
+    def _wd_load_into_calc(self, d):
+        """保存済み取込データ1件を給与計算タブへ再読込する。"""
+        rows = [tuple(r) for r in d["rows"]]
+        mapping = db.get_mapping()
+        rates = self._rates()
+        kotsu_unit = parse_int(self.var_kotsu.get())
+        res = calc.calc_rows(rows, mapping)
+        self._remove_person_tab(d["person"])
+        self._add_person_tab(d["person"], res, rates, kotsu_unit, rows=rows)
+        return res
+
+    def _wd_reload_selected(self):
+        sel = self.wd_tree.selection()
+        if not sel:
+            messagebox.showinfo("選択なし", "再読込するデータを選択してください。")
+            return
+        wid = int(self.wd_tree.item(sel[0])["values"][0])
+        d = db.get_work_data(wid)
+        if not d:
+            return
+        if d.get("period"):
+            self.var_period.set(d["period"])
+        self._wd_load_into_calc(d)
+        self._select_tab(self.tab_calc)
+        self.calc_nb.select(self.calc_nb.tabs()[-1])
+        self.calc_status.config(text=f"{d['person']} の取込データを再読込しました。",
+                                foreground="#060")
+
+    def _wd_reload_all(self):
+        data = db.list_work_data()
+        if not data:
+            messagebox.showinfo("データなし", "保存された取込データがありません。")
+            return
+        for tab in self.calc_nb.tabs():
+            self.calc_nb.forget(tab)
+        self.person_tabs.clear()
+        for d in data:
+            self._wd_load_into_calc(d)
+        self._select_tab(self.tab_calc)
+        if self.calc_nb.tabs():
+            self.calc_nb.select(self.calc_nb.tabs()[0])
+        self.calc_status.config(text=f"保存された取込データ {len(data)} 件を再読込しました。",
+                                foreground="#060")
+
+    def _wd_delete(self):
+        sel = self.wd_tree.selection()
+        if not sel:
+            messagebox.showinfo("選択なし", "削除するデータを選択してください。")
+            return
+        wid = int(self.wd_tree.item(sel[0])["values"][0])
+        if messagebox.askyesno("確認", "選択した労働記録を削除しますか？"):
+            db.delete_work_data(wid)
+            self._refresh_workdata()
+            self.wd_status.config(text="削除しました。", foreground="#060")
+
+    def _wd_selected(self):
+        sel = self.wd_tree.selection()
+        if not sel:
+            messagebox.showinfo("選択なし", "出力するデータを一覧から選択してください。")
+            return None
+        wid = int(self.wd_tree.item(sel[0])["values"][0])
+        return db.get_work_data(wid)
+
+    def _wd_export_record(self):
+        """選択した労働記録を「勤務実績」書式の PDF で出力（元デザイン準拠）。"""
+        d = self._wd_selected()
+        if not d:
+            return
+        default = f"勤務実績_{d['person']}_{d.get('period') or ''}.pdf".replace("/", "-")
+        path = filedialog.asksaveasfilename(
+            title="労働記録(勤務実績)の保存先", defaultextension=".pdf",
+            initialfile=default, filetypes=[("PDF", "*.pdf")])
+        if not path:
+            return
+        try:
+            pdf.export_work_record_pdf(d["person"], d.get("period"), d["rows"],
+                                       db.get_mapping(), path)
+        except Exception as ex:
+            messagebox.showerror("出力エラー", str(ex))
+            return
+        self.wd_status.config(text=f"労働記録(勤務実績)を出力しました: {path}",
+                              foreground="#060")
+        if messagebox.askyesno("完了", f"労働記録を出力しました。\n{path}\n\n開きますか？"):
+            os.startfile(path)
+
+    def _wd_export_attendance(self):
+        """選択した労働記録から「個人出勤簿」書式の PDF をダウンロード（元デザイン準拠）。"""
+        d = self._wd_selected()
+        if not d:
+            return
+        default = f"個人出勤簿_{d['person']}_{d.get('period') or ''}.pdf".replace("/", "-")
+        path = filedialog.asksaveasfilename(
+            title="個人出勤簿の保存先", defaultextension=".pdf",
+            initialfile=default, filetypes=[("PDF", "*.pdf")])
+        if not path:
+            return
+        s = db.get_settings()
+        try:
+            pdf.export_attendance_pdf(
+                d["person"], d.get("period"), d["rows"], path,
+                start=s.get("attend_start", "8:30"),
+                end=s.get("attend_end", "17:30"),
+                shotei=s.get("attend_shotei", "9:00"),
+                post=s.get("attend_post", "訪問介護職員"),
+                employ=s.get("attend_employ", "パートスタッフ"))
+        except Exception as ex:
+            messagebox.showerror("出力エラー", str(ex))
+            return
+        self.wd_status.config(text=f"個人出勤簿をダウンロードしました: {path}",
+                              foreground="#060")
+        if messagebox.askyesno("完了", f"個人出勤簿を出力しました。\n{path}\n\n開きますか？"):
+            os.startfile(path)
+
     # ============================================================ 計算記録
     def _build_records(self):
         t = self.tab_records
@@ -336,7 +770,8 @@ class App(tk.Tk):
 
         bar = ttk.Frame(t)
         bar.pack(fill="x")
-        ttk.Button(bar, text="PDFで出力", command=self._rec_pdf).pack(side="left")
+        ttk.Button(bar, text="PDFで出力", command=self._rec_pdf,
+                   style="Accent.TButton").pack(side="left")
         ttk.Button(bar, text="削除", command=self._rec_delete).pack(side="left", padx=6)
         ttk.Button(bar, text="再読み込み", command=self._refresh_records).pack(side="left")
         self._refresh_records()
@@ -391,7 +826,8 @@ class App(tk.Tk):
         ttk.Radiobutton(bar, text="保存済み記録すべて", variable=self.total_mode,
                         value="records", command=self._refresh_totals).pack(side="left")
         ttk.Button(bar, text="更新", command=self._refresh_totals).pack(side="left", padx=8)
-        ttk.Button(bar, text="総計をPDF出力", command=self._totals_pdf).pack(side="left")
+        ttk.Button(bar, text="総計をPDF出力", command=self._totals_pdf,
+                   style="Accent.TButton").pack(side="left")
 
         cols = ("person", "visits", "total_min", "amt_training", "amt_living",
                 "amt_body", "kotsu", "extra", "total_amount")
@@ -470,7 +906,8 @@ class App(tk.Tk):
         bar.pack(fill="x")
         ttk.Button(bar, text="行を追加", command=self._map_add).pack(side="left")
         ttk.Button(bar, text="選択行を削除", command=self._map_del).pack(side="left", padx=6)
-        ttk.Button(bar, text="保存", command=self._map_save).pack(side="left")
+        ttk.Button(bar, text="保存", command=self._map_save,
+                   style="Accent.TButton").pack(side="left")
         ttk.Button(bar, text="既定に戻す", command=self._map_reset).pack(side="left", padx=6)
         self.map_status = ttk.Label(t, text="", foreground="#060")
         self.map_status.pack(anchor="w")
@@ -541,9 +978,13 @@ class App(tk.Tk):
                  ("rate_body", "身体時給 (円)"), ("kotsu_unit", "交通費 1件単価 (円)"),
                  ("rate_kaizen_living", "処遇改善手当 (生活/時間)"),
                  ("rate_kaizen_body", "処遇改善手当 (身体/時間)"),
-                 ("default_shikaku", "資格手当 初期値 (円/時)")]
+                 ("default_shikaku", "資格手当 初期値/未登録者 (円/時)"),
+                 ("shikaku_shoninsha", "資格手当（初任者） (円/時)"),
+                 ("shikaku_jitsumusha", "資格手当（実務者） (円/時)"),
+                 ("shikaku_kaigofukushishi", "資格手当（介護福祉士） (円/時)"),
+                 ("shikaku_sonota", "資格手当（その他） (円/時)")]
         for i, (key, label) in enumerate(items):
-            ttk.Label(fr, text=label, width=20, anchor="w").grid(row=i, column=0, sticky="w", pady=4)
+            ttk.Label(fr, text=label, width=28, anchor="w").grid(row=i, column=0, sticky="w", pady=4)
             v = tk.StringVar(value=s[key])
             self.set_vars[key] = v
             ttk.Entry(fr, textvariable=v, width=12, justify="right").grid(row=i, column=1, sticky="w")
@@ -551,7 +992,27 @@ class App(tk.Tk):
         ttk.Label(t, text="※時給は給与計算画面でも対象月ごとに変更できます。\n"
                           "※交通費は『単価 × 訪問件数』で全員一律計算されます。",
                   foreground="#666").pack(anchor="w", pady=8)
-        ttk.Button(t, text="保存", command=self._settings_save).pack(anchor="w")
+
+        # 個人出勤簿の既定値(文字列・時刻はそのまま保存)
+        ttk.Label(t, text="個人出勤簿の既定値", font=FONT_B).pack(anchor="w", pady=(8, 4))
+        afr = ttk.Frame(t)
+        afr.pack(anchor="w")
+        self.attend_vars = {}
+        aitems = [("attend_start", "始業時間 (例 8:30)"),
+                  ("attend_end", "終業時間 (例 17:30)"),
+                  ("attend_shotei", "所定内勤務時間 (例 9:00)"),
+                  ("attend_post", "所属"),
+                  ("attend_employ", "雇用形態")]
+        for i, (key, label) in enumerate(aitems):
+            ttk.Label(afr, text=label, width=28, anchor="w").grid(row=i, column=0, sticky="w", pady=4)
+            v = tk.StringVar(value=s.get(key, ""))
+            self.attend_vars[key] = v
+            ttk.Entry(afr, textvariable=v, width=16).grid(row=i, column=1, sticky="w")
+        ttk.Label(t, text="※ケア時間はデータから日別集計、ケア以外時間＝所定内−ケア時間で算出します。",
+                  foreground="#666").pack(anchor="w", pady=(6, 0))
+
+        ttk.Button(t, text="保存", command=self._settings_save,
+                   style="Accent.TButton").pack(anchor="w", pady=(8, 0))
         self.set_status = ttk.Label(t, text="", foreground="#060")
         self.set_status.pack(anchor="w", pady=4)
 
@@ -564,6 +1025,9 @@ class App(tk.Tk):
 
     def _settings_save(self):
         d = {k: str(parse_int(v.get())) for k, v in self.set_vars.items()}
+        # 個人出勤簿の既定値は文字列のまま保存
+        for k, v in self.attend_vars.items():
+            d[k] = v.get().strip()
         db.save_settings(d)
         # 計算画面へ反映
         self.var_train.set(d["rate_training"])
@@ -582,6 +1046,8 @@ class App(tk.Tk):
             self._refresh_totals()
         elif cur == "計算記録":
             self._refresh_records()
+        elif cur == "労働記録":
+            self._refresh_workdata()
 
 
 if __name__ == "__main__":

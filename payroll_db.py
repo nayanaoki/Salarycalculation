@@ -2,6 +2,7 @@
 """データ保管 (SQLite) と設定・対応表の管理。"""
 import sqlite3
 import datetime
+import json
 
 import app_paths
 
@@ -29,6 +30,17 @@ DEFAULT_MAPPING = {
     "身２生３・Ⅱ": (60, 70),
 }
 
+# 資格の選択肢（従業員管理のプルダウン・資格手当の区分）
+QUALIFICATIONS = ["初任者", "実務者", "介護福祉士", "その他"]
+
+# 資格 → 資格手当(円/時)の設定キー
+SHIKAKU_KEYS = {
+    "初任者": "shikaku_shoninsha",
+    "実務者": "shikaku_jitsumusha",
+    "介護福祉士": "shikaku_kaigofukushishi",
+    "その他": "shikaku_sonota",
+}
+
 DEFAULT_SETTINGS = {
     "rate_training": "1100",        # 研修時給
     "rate_living": "1200",          # 生活時給
@@ -37,6 +49,15 @@ DEFAULT_SETTINGS = {
     "rate_kaizen_living": "0",      # 処遇改善手当 (生活/時間)
     "rate_kaizen_body": "0",        # 処遇改善手当 (身体/時間)
     "default_shikaku": "0",         # 資格手当 初期値 (1時間あたりの支給額・各人で編集可能)
+    "shikaku_shoninsha": "0",       # 資格手当(初任者) 円/時
+    "shikaku_jitsumusha": "0",      # 資格手当(実務者) 円/時
+    "shikaku_kaigofukushishi": "0",  # 資格手当(介護福祉士) 円/時
+    "shikaku_sonota": "0",          # 資格手当(その他) 円/時
+    "attend_start": "8:30",         # 個人出勤簿 始業時間
+    "attend_end": "17:30",          # 個人出勤簿 終業時間
+    "attend_shotei": "9:00",        # 個人出勤簿 所定内勤務時間
+    "attend_post": "訪問介護職員",   # 個人出勤簿 所属
+    "attend_employ": "パートスタッフ",  # 個人出勤簿 雇用形態
 }
 
 
@@ -61,6 +82,15 @@ def init_db():
         key TEXT PRIMARY KEY, value TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS mapping(
         service TEXT PRIMARY KEY, body INTEGER, living INTEGER)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS employees(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mgmt_no TEXT, name TEXT NOT NULL, qualification TEXT,
+        created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS work_data(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        person TEXT, period TEXT, rows_json TEXT,
+        created_at TEXT, updated_at TEXT,
+        UNIQUE(person, period))""")
     c.execute("""CREATE TABLE IF NOT EXISTS records(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         person TEXT, period TEXT,
@@ -165,3 +195,140 @@ def delete_record(rid):
     conn.execute("DELETE FROM records WHERE id=?", (rid,))
     conn.commit()
     conn.close()
+
+
+# --- 従業員 ---
+def list_employees():
+    conn = connect()
+    rows = conn.execute(
+        "SELECT id,mgmt_no,name,qualification FROM employees "
+        "ORDER BY mgmt_no, id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_employee(mgmt_no, name, qualification):
+    conn = connect()
+    conn.execute(
+        "INSERT INTO employees(mgmt_no,name,qualification,created_at) "
+        "VALUES(?,?,?,?)",
+        (mgmt_no, name, qualification,
+         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+
+
+def update_employee(eid, mgmt_no, name, qualification):
+    conn = connect()
+    conn.execute(
+        "UPDATE employees SET mgmt_no=?, name=?, qualification=? WHERE id=?",
+        (mgmt_no, name, qualification, eid))
+    conn.commit()
+    conn.close()
+
+
+def delete_employee(eid):
+    conn = connect()
+    conn.execute("DELETE FROM employees WHERE id=?", (eid,))
+    conn.commit()
+    conn.close()
+
+
+def get_employee_by_name(name):
+    """氏名で従業員を1件取得(前後空白は無視)。未登録なら None。"""
+    if not name:
+        return None
+    conn = connect()
+    r = conn.execute(
+        "SELECT id,mgmt_no,name,qualification FROM employees "
+        "WHERE TRIM(name)=TRIM(?) LIMIT 1", (name,)).fetchone()
+    conn.close()
+    return dict(r) if r else None
+
+
+def _to_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+# --- 取込データ(読み込んだ勤務実績の生データ) ---
+def _cell_to_str(v):
+    return "" if v is None else str(v)
+
+
+def save_work_data(person, period, rows):
+    """読み込んだ生データ(行の並び)を person+period 単位で保存(upsert)。
+
+    セルは datetime.time 等になり得るため文字列化して JSON で保管する。
+    再読込時は calc.calc_rows がそのまま集計できる。
+    """
+    norm = [[_cell_to_str(c) for c in row] for row in rows]
+    payload = json.dumps(norm, ensure_ascii=False)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = connect()
+    conn.execute(
+        "INSERT INTO work_data(person,period,rows_json,created_at,updated_at) "
+        "VALUES(?,?,?,?,?) "
+        "ON CONFLICT(person,period) DO UPDATE SET "
+        "rows_json=excluded.rows_json, updated_at=excluded.updated_at",
+        (person, period, payload, now, now))
+    conn.commit()
+    conn.close()
+
+
+def list_work_data():
+    """保存済み取込データの一覧(生データ含む)。"""
+    conn = connect()
+    rows = conn.execute(
+        "SELECT id,person,period,rows_json,updated_at FROM work_data "
+        "ORDER BY updated_at DESC, id DESC").fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["rows"] = json.loads(d.pop("rows_json") or "[]")
+        except (ValueError, TypeError):
+            d["rows"] = []
+        out.append(d)
+    return out
+
+
+def get_work_data(wid):
+    conn = connect()
+    r = conn.execute(
+        "SELECT id,person,period,rows_json,updated_at FROM work_data WHERE id=?",
+        (wid,)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    d = dict(r)
+    try:
+        d["rows"] = json.loads(d.pop("rows_json") or "[]")
+    except (ValueError, TypeError):
+        d["rows"] = []
+    return d
+
+
+def delete_work_data(wid):
+    conn = connect()
+    conn.execute("DELETE FROM work_data WHERE id=?", (wid,))
+    conn.commit()
+    conn.close()
+
+
+def shikaku_rate_for(qualification, settings=None):
+    """資格に対応する資格手当(円/時)を返す。
+
+    その資格の手当が設定されている(0より大きい)ときはそれを適用し、
+    未設定(0)や未登録の資格のときは default_shikaku(初期値)を適用する。
+    """
+    settings = settings or get_settings()
+    key = SHIKAKU_KEYS.get(qualification or "")
+    if key:
+        rate = _to_float(settings.get(key))
+        if rate > 0:
+            return rate
+    return _to_float(settings.get("default_shikaku", 0))
