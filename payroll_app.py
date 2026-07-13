@@ -6,7 +6,7 @@
   - 結果を PDF 出力
   - 対応表(身体・生活の割当)編集画面
   - その他項目(時給・交通費単価)設定画面
-  - 交通費は 1件当たり単価 × 訪問件数
+  - 交通費は 交通費単価 × 交通費対象件数（初回除外・連続提供の条件を反映）
 """
 import os
 import sys
@@ -320,6 +320,10 @@ class App(tk.Tk):
         self.file_label.config(text=path, foreground="#000")
         self.calculate()
 
+    def _kotsu_first_included(self):
+        """1日の最初の1件を交通費対象に含めるか（その他項目設定の値）。"""
+        return db.get_settings().get("kotsu_first_included", "1") != "0"
+
     def _rates(self):
         return {"training": float(parse_int(self.var_train.get())),
                 "living": float(parse_int(self.var_living.get())),
@@ -338,13 +342,16 @@ class App(tk.Tk):
         mapping = db.get_mapping()
         rates = self._rates()
         kotsu_unit = parse_int(self.var_kotsu.get())
+        first_inc = self._kotsu_first_included()
 
         errors = []
         for ws in self.workbook.worksheets:
             rows = calc.sheet_rows(ws)
-            res = calc.calc_rows(rows, mapping)
-            # 読み込んだ生データをそのまま保存(person+period で upsert)
+            # 読み込んだ生データをそのまま保存(person+period で upsert)。
+            # 既存の交通費あり/なし手動設定は保持されるため、それを反映して計算する。
             db.save_work_data(ws.title, self.var_period.get(), rows)
+            flags = db.get_kotsu_flags(ws.title, self.var_period.get())
+            res = calc.calc_rows(rows, mapping, first_inc, flags)
             self._add_person_tab(ws.title, res, rates, kotsu_unit, rows=rows)
             if res["errors"]:
                 errors.append(f"[{ws.title}] {', '.join(sorted(set(res['errors'])))}")
@@ -385,6 +392,20 @@ class App(tk.Tk):
             if qual else "資格:  従業員未登録（既定の資格手当を適用）"
         ttk.Label(work, text=qual_text, foreground="#036").grid(row=2, column=0, sticky="w", pady=(2, 0))
 
+        # 交通費・按分の適用状況を明示（見て分かるように）
+        notes = []
+        if res.get("kotsu_count", res["visits"]) != res["visits"]:
+            notes.append(
+                f"交通費対象 {res.get('kotsu_count')} 件"
+                f"（連続提供や初回除外により {res['visits']} 件から調整）")
+        if res.get("apportioned"):
+            notes.append(
+                f"按分計算 {res['apportioned']} 件"
+                "（規定提供時間未満のため身体:生活比で実時間を配分）")
+        if notes:
+            ttk.Label(work, text="※ " + "  /  ".join(notes),
+                      foreground="#a0006a").grid(row=3, column=0, sticky="w", pady=(2, 0))
+
         # 給与
         pay = ttk.LabelFrame(frame, text="給与に関する内容", padding=8)
         pay.pack(fill="both", expand=True, pady=6)
@@ -403,14 +424,15 @@ class App(tk.Tk):
         amt_l = calc.yen(res["living_min"], rates["living"])
         amt_b = calc.yen(res["body_min"], rates["body"])
         amt_k = calc.calc_kaizen(res, rates)
-        kotsu = res["visits"] * kotsu_unit
+        kotsu_count = res.get("kotsu_count", res["visits"])
+        kotsu = kotsu_count * kotsu_unit
         st.update(amt_t=amt_t, amt_l=amt_l, amt_b=amt_b, amt_k=amt_k, kotsu=kotsu)
 
         disp(1, "研修時給", res["training_min"], amt_t)
         disp(2, "生活時給", res["living_min"], amt_l)
         disp(3, "身体時給", res["body_min"], amt_b)
         disp(4, "処遇改善手当", None, amt_k)
-        disp(5, f"交通費 ({res['visits']}件×{kotsu_unit}円)", None, kotsu)
+        disp(5, f"交通費 ({kotsu_count}件×{kotsu_unit}円)", None, kotsu)
 
         # 編集可能項目 (資格手当は保有資格に応じた円/時をプリセット・上書き可)
         st["var_shikaku"] = tk.StringVar(value=str(int(round(shikaku_rate))))
@@ -549,9 +571,10 @@ class App(tk.Tk):
             mapping = db.get_mapping()
             rates = self._rates()
             kotsu_unit = parse_int(self.var_kotsu.get())
-            res = calc.calc_rows(rows, mapping)
-            # 貼り付けた生データもそのまま保存
+            # 貼り付けた生データもそのまま保存（既存の交通費手動設定は保持）
             db.save_work_data(name, self.var_period.get(), rows)
+            flags = db.get_kotsu_flags(name, self.var_period.get())
+            res = calc.calc_rows(rows, mapping, self._kotsu_first_included(), flags)
             self._remove_person_tab(name)
             self._add_person_tab(name, res, rates, kotsu_unit, rows=rows)
             self._refresh_workdata()
@@ -601,12 +624,13 @@ class App(tk.Tk):
         heads = {"id": "ID", "person": "氏名", "period": "期間",
                  "lines": "明細行数", "updated_at": "保存日時"}
         widths = {"id": 40, "person": 140, "period": 110, "lines": 80, "updated_at": 160}
-        tv = ttk.Treeview(t, columns=cols, show="headings", height=15)
+        tv = ttk.Treeview(t, columns=cols, show="headings", height=8)
         for cn in cols:
             tv.heading(cn, text=heads[cn])
             tv.column(cn, width=widths[cn],
                       anchor="w" if cn in ("person", "period") else "center")
-        tv.pack(fill="both", expand=True, pady=6)
+        tv.pack(fill="x", pady=6)
+        tv.bind("<<TreeviewSelect>>", self._wd_on_select)
         self.wd_tree = tv
 
         bar = ttk.Frame(t)
@@ -628,6 +652,45 @@ class App(tk.Tk):
                    command=self._wd_reload_all).pack(side="left", padx=6)
         ttk.Button(bar2, text="選択を削除", command=self._wd_delete).pack(side="left")
         ttk.Button(bar2, text="再表示", command=self._refresh_workdata).pack(side="left", padx=6)
+
+        # --- 選択した人の労働記録の明細（1件ずつ交通費のあり／なしを切替） ---
+        det = ttk.LabelFrame(
+            t, text="選択した労働記録の明細（1件ずつ選択して交通費のあり／なしを切替）",
+            padding=8)
+        det.pack(fill="both", expand=True, pady=(10, 4))
+        self.wd_detail_info = ttk.Label(
+            det, text="上の一覧から氏名を選択すると、その人の訪問明細を表示します。",
+            foreground="#036")
+        self.wd_detail_info.pack(anchor="w", pady=(0, 4))
+
+        dcols = ("no", "date", "dow", "user", "service", "minutes", "kind", "kotsu")
+        dheads = {"no": "No.", "date": "日付", "dow": "曜日", "user": "利用者",
+                  "service": "内容", "minutes": "時間(分)", "kind": "区分",
+                  "kotsu": "交通費"}
+        dwidths = {"no": 40, "date": 90, "dow": 50, "user": 140, "service": 150,
+                   "minutes": 70, "kind": 90, "kotsu": 80}
+        dtv = ttk.Treeview(det, columns=dcols, show="headings", height=10)
+        for cn in dcols:
+            dtv.heading(cn, text=dheads[cn])
+            dtv.column(cn, width=dwidths[cn],
+                       anchor="w" if cn in ("user", "service") else "center")
+        dtv.tag_configure("on", foreground="#036")
+        dtv.tag_configure("off", foreground="#a00")
+        dtv.pack(fill="both", expand=True, pady=4)
+        dtv.bind("<Double-1>", lambda _e: self._wd_toggle_kotsu())
+        self.wd_detail = dtv
+
+        dbar = ttk.Frame(det)
+        dbar.pack(fill="x")
+        ttk.Button(dbar, text="選択した記録の交通費 あり／なし を切替",
+                   command=self._wd_toggle_kotsu,
+                   style="Accent.TButton").pack(side="left")
+        ttk.Button(dbar, text="自動判定に戻す",
+                   command=self._wd_reset_kotsu).pack(side="left", padx=6)
+        ttk.Label(dbar, text="※行をダブルクリックでも切り替わります。変更は自動保存され、"
+                            "給与計算・PDFの交通費に反映されます。",
+                  foreground="#666").pack(side="left", padx=8)
+        self._wd_cur = None
         self._refresh_workdata()
 
     def _refresh_workdata(self):
@@ -638,6 +701,116 @@ class App(tk.Tk):
             self.wd_tree.insert("", "end", values=(
                 d["id"], d["person"], d["period"] or "", f"{len(d['rows'])}行",
                 d["updated_at"]))
+        self._wd_clear_detail()
+
+    # ------------------------------------------------------------ 明細・交通費切替
+    @staticmethod
+    def _detail_kind(d):
+        if d.get("error"):
+            return "対応表外"
+        if d.get("training"):
+            return "研修"
+        if d.get("body") and d.get("living"):
+            return "身体+生活"
+        if d.get("body"):
+            return "身体"
+        if d.get("living"):
+            return "生活"
+        return "-"
+
+    def _wd_clear_detail(self):
+        if not hasattr(self, "wd_detail"):
+            return
+        self.wd_detail.delete(*self.wd_detail.get_children())
+        self._wd_cur = None
+        self.wd_detail_info.config(
+            text="上の一覧から氏名を選択すると、その人の訪問明細を表示します。",
+            foreground="#036")
+
+    def _wd_on_select(self, _e=None):
+        sel = self.wd_tree.selection()
+        if not sel:
+            return
+        wid = int(self.wd_tree.item(sel[0])["values"][0])
+        d = db.get_work_data(wid)
+        if not d:
+            return
+        rows = [tuple(r) for r in d["rows"]]
+        flags = list(d.get("kotsu_flags") or [])
+        self._wd_cur = {"id": wid, "person": d["person"], "period": d.get("period"),
+                        "rows": rows, "flags": flags}
+        self._wd_render_detail()
+
+    def _wd_render_detail(self):
+        cur = self._wd_cur
+        if not cur:
+            return
+        dtv = self.wd_detail
+        dtv.delete(*dtv.get_children())
+        details = calc.visit_details(
+            cur["rows"], db.get_mapping(), self._kotsu_first_included(),
+            cur["flags"])
+        charge = 0
+        for d in details:
+            i = d["visit_index"]
+            on = d["kotsu"]
+            if on:
+                charge += 1
+            mark = "あり" if on else "なし"
+            if d["kotsu"] != d["kotsu_auto"]:
+                mark += "※"          # 手動で自動判定を上書きした行
+            dtv.insert("", "end", iid=str(i), tags=("on" if on else "off",), values=(
+                i + 1, d.get("date", ""), d.get("dow", "") or "",
+                d.get("user", "") or "", d.get("service", "") or "",
+                d.get("minutes", 0), self._detail_kind(d), mark))
+        self.wd_detail_info.config(
+            text=f"{cur['person']}  {cur['period'] or ''}  ／  "
+                 f"訪問 {len(details)} 件中 交通費対象 {charge} 件"
+                 f"（あり＝支給・※は手動で変更）",
+            foreground="#036")
+
+    def _wd_selected_visit_index(self):
+        if not self._wd_cur:
+            messagebox.showinfo("選択なし", "上の一覧から氏名（労働記録）を選択してください。")
+            return None
+        sel = self.wd_detail.selection()
+        if not sel:
+            messagebox.showinfo("選択なし", "交通費を切り替える明細行を選択してください。")
+            return None
+        return int(sel[0])
+
+    def _wd_apply_flag(self, idx, value):
+        """訪問 idx の交通費フラグを value(True/False/None)にして保存・再描画。"""
+        cur = self._wd_cur
+        flags = cur["flags"]
+        if len(flags) <= idx:
+            flags.extend([None] * (idx + 1 - len(flags)))
+        flags[idx] = value
+        db.save_kotsu_flags(cur["person"], cur["period"], flags)
+        self._wd_render_detail()
+        self.wd_detail.selection_set(str(idx))
+        self.wd_detail.see(str(idx))
+
+    def _wd_toggle_kotsu(self):
+        idx = self._wd_selected_visit_index()
+        if idx is None:
+            return
+        details = calc.visit_details(
+            self._wd_cur["rows"], db.get_mapping(), self._kotsu_first_included(),
+            self._wd_cur["flags"])
+        current = details[idx]["kotsu"] if idx < len(details) else False
+        self._wd_apply_flag(idx, not current)
+        self.wd_status.config(
+            text=f"No.{idx + 1} の交通費を「{'あり' if not current else 'なし'}」に変更しました。",
+            foreground="#060")
+
+    def _wd_reset_kotsu(self):
+        idx = self._wd_selected_visit_index()
+        if idx is None:
+            return
+        self._wd_apply_flag(idx, None)
+        self.wd_status.config(text=f"No.{idx + 1} の交通費を自動判定に戻しました。",
+                              foreground="#060")
 
     def _wd_load_into_calc(self, d):
         """保存済み取込データ1件を給与計算タブへ再読込する。"""
@@ -645,7 +818,8 @@ class App(tk.Tk):
         mapping = db.get_mapping()
         rates = self._rates()
         kotsu_unit = parse_int(self.var_kotsu.get())
-        res = calc.calc_rows(rows, mapping)
+        res = calc.calc_rows(rows, mapping, self._kotsu_first_included(),
+                             d.get("kotsu_flags"))
         self._remove_person_tab(d["person"])
         self._add_person_tab(d["person"], res, rates, kotsu_unit, rows=rows)
         return res
@@ -890,14 +1064,21 @@ class App(tk.Tk):
                   foreground="#666").pack(anchor="w")
         ttk.Label(t, text="※対応表外のサービスはエラーになります。ここに追加してください。",
                   foreground="#a00").pack(anchor="w")
-        cols = ("service", "body", "living")
+        ttk.Label(t, text="※身体＋生活＝規定提供時間。実提供時間が規定未満の場合は、"
+                          "身体:生活の比率を保ったまま実提供時間を按分して計算します。",
+                  foreground="#036").pack(anchor="w")
+        cols = ("service", "body", "living", "kitei", "ratio")
         tv = ttk.Treeview(t, columns=cols, show="headings", height=15)
         tv.heading("service", text="サービス内容")
         tv.heading("body", text="身体(分)")
         tv.heading("living", text="生活(分)")
-        tv.column("service", width=260, anchor="w")
-        tv.column("body", width=100, anchor="center")
-        tv.column("living", width=100, anchor="center")
+        tv.heading("kitei", text="規定計(分)")
+        tv.heading("ratio", text="割合")
+        tv.column("service", width=240, anchor="w")
+        tv.column("body", width=90, anchor="center")
+        tv.column("living", width=90, anchor="center")
+        tv.column("kitei", width=90, anchor="center")
+        tv.column("ratio", width=170, anchor="w")
         tv.pack(fill="both", expand=True, pady=6)
         tv.bind("<Double-1>", self._map_edit_cell)
         self.map_tree = tv
@@ -913,10 +1094,27 @@ class App(tk.Tk):
         self.map_status.pack(anchor="w")
         self._refresh_mapping()
 
+    @staticmethod
+    def _ratio_text(body, living):
+        """規定提供時間に占める身体・生活の割合を「身体60% 生活40%」形式で返す。"""
+        b = parse_int(body)
+        l = parse_int(living)
+        total = b + l
+        if total <= 0:
+            return "-"
+        bp = int(round(b * 100 / total))
+        lp = 100 - bp
+        if l == 0:
+            return "身体100%"
+        if b == 0:
+            return "生活100%"
+        return f"身体{bp}%  生活{lp}%"
+
     def _refresh_mapping(self):
         self.map_tree.delete(*self.map_tree.get_children())
         for s, (b, l) in db.get_mapping().items():
-            self.map_tree.insert("", "end", values=(s, b, l))
+            self.map_tree.insert("", "end",
+                                 values=(s, b, l, b + l, self._ratio_text(b, l)))
 
     def _map_edit_cell(self, event):
         tv = self.map_tree
@@ -925,6 +1123,8 @@ class App(tk.Tk):
         if not row:
             return
         col_idx = int(col[1:]) - 1
+        if col_idx >= 3:                     # 規定計・割合は自動計算(編集不可)
+            return
         x, y, w, hgt = tv.bbox(row, col)
         cur = tv.item(row)["values"][col_idx]
         ent = ttk.Entry(tv)
@@ -938,13 +1138,16 @@ class App(tk.Tk):
             if col_idx in (1, 2):
                 v = parse_int(v)
             vals[col_idx] = v
+            if col_idx in (1, 2):            # 規定計・割合を再計算して表示
+                vals[3] = parse_int(vals[1]) + parse_int(vals[2])
+                vals[4] = self._ratio_text(vals[1], vals[2])
             tv.item(row, values=vals)
             ent.destroy()
         ent.bind("<Return>", commit)
         ent.bind("<FocusOut>", commit)
 
     def _map_add(self):
-        self.map_tree.insert("", "end", values=("新規サービス", 0, 0))
+        self.map_tree.insert("", "end", values=("新規サービス", 0, 0, 0, "-"))
 
     def _map_del(self):
         for s in self.map_tree.selection():
@@ -953,7 +1156,8 @@ class App(tk.Tk):
     def _map_save(self):
         mapping = {}
         for iid in self.map_tree.get_children():
-            s, b, l = self.map_tree.item(iid)["values"]
+            vals = self.map_tree.item(iid)["values"]
+            s, b, l = vals[0], vals[1], vals[2]
             s = str(s).strip()
             if s:
                 mapping[s] = (parse_int(b), parse_int(l))
@@ -975,7 +1179,7 @@ class App(tk.Tk):
         fr.pack(anchor="w")
         self.set_vars = {}
         items = [("rate_training", "研修時給 (円)"), ("rate_living", "生活時給 (円)"),
-                 ("rate_body", "身体時給 (円)"), ("kotsu_unit", "交通費 1件単価 (円)"),
+                 ("rate_body", "身体時給 (円)"), ("kotsu_unit", "交通費単価 (円)"),
                  ("rate_kaizen_living", "処遇改善手当 (生活/時間)"),
                  ("rate_kaizen_body", "処遇改善手当 (身体/時間)"),
                  ("default_shikaku", "資格手当 初期値/未登録者 (円/時)"),
@@ -989,8 +1193,25 @@ class App(tk.Tk):
             self.set_vars[key] = v
             ttk.Entry(fr, textvariable=v, width=12, justify="right").grid(row=i, column=1, sticky="w")
 
+        # 交通費の条件（1日の最初の1件を含める/含めない）
+        kfr = ttk.LabelFrame(t, text="交通費の条件", padding=8)
+        kfr.pack(anchor="w", pady=(10, 0))
+        self.var_kotsu_first = tk.StringVar(
+            value=("0" if s.get("kotsu_first_included", "1") == "0" else "1"))
+        ttk.Label(kfr, text="1日の最初の1件目を交通費計算に:").grid(
+            row=0, column=0, sticky="w")
+        ttk.Radiobutton(kfr, text="含める", variable=self.var_kotsu_first,
+                        value="1").grid(row=0, column=1, padx=8)
+        ttk.Radiobutton(kfr, text="含めない", variable=self.var_kotsu_first,
+                        value="0").grid(row=0, column=2)
+        ttk.Label(kfr, text="※「含めない」の場合、1日にN件あれば最初の1件を除く N-1 件が交通費対象になります。",
+                  foreground="#666").grid(row=1, column=0, columnspan=3,
+                                          sticky="w", pady=(4, 0))
+
         ttk.Label(t, text="※時給は給与計算画面でも対象月ごとに変更できます。\n"
-                          "※交通費は『単価 × 訪問件数』で全員一律計算されます。",
+                          "※交通費は『交通費単価 × 交通費対象件数』で計算します。"
+                          "サービス提供終了時刻と次のサービス開始時刻が同じ場合は、"
+                          "移動なしとして交通費対象外です（全利用者共通）。",
                   foreground="#666").pack(anchor="w", pady=8)
 
         # 個人出勤簿の既定値(文字列・時刻はそのまま保存)
@@ -1028,6 +1249,8 @@ class App(tk.Tk):
         # 個人出勤簿の既定値は文字列のまま保存
         for k, v in self.attend_vars.items():
             d[k] = v.get().strip()
+        # 交通費の条件（含める/含めない）
+        d["kotsu_first_included"] = self.var_kotsu_first.get()
         db.save_settings(d)
         # 計算画面へ反映
         self.var_train.set(d["rate_training"])

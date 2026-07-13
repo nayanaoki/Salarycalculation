@@ -45,7 +45,8 @@ DEFAULT_SETTINGS = {
     "rate_training": "1100",        # 研修時給
     "rate_living": "1200",          # 生活時給
     "rate_body": "1500",            # 身体時給
-    "kotsu_unit": "100",            # 交通費 1件単価
+    "kotsu_unit": "100",            # 交通費単価 (1件あたり)
+    "kotsu_first_included": "1",    # 1日の最初の1件を交通費対象に含める(1)/含めない(0)
     "rate_kaizen_living": "0",      # 処遇改善手当 (生活/時間)
     "rate_kaizen_body": "0",        # 処遇改善手当 (身体/時間)
     "default_shikaku": "0",         # 資格手当 初期値 (1時間あたりの支給額・各人で編集可能)
@@ -88,7 +89,7 @@ def init_db():
         created_at TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS work_data(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        person TEXT, period TEXT, rows_json TEXT,
+        person TEXT, period TEXT, rows_json TEXT, kotsu_flags TEXT,
         created_at TEXT, updated_at TEXT,
         UNIQUE(person, period))""")
     c.execute("""CREATE TABLE IF NOT EXISTS records(
@@ -98,7 +99,7 @@ def init_db():
         body_min INTEGER, living_min INTEGER, training_min INTEGER,
         rate_training REAL, rate_living REAL, rate_body REAL,
         amt_training INTEGER, amt_living INTEGER, amt_body INTEGER,
-        kotsu INTEGER, shikaku INTEGER, rate_shikaku REAL,
+        kotsu INTEGER, kotsu_count INTEGER, shikaku INTEGER, rate_shikaku REAL,
         other1 INTEGER, other2 INTEGER,
         rate_kaizen_living REAL, rate_kaizen_body REAL, amt_kaizen INTEGER,
         total_amount INTEGER, created_at TEXT)""")
@@ -108,7 +109,9 @@ def init_db():
         "rate_kaizen_body": "REAL",
         "amt_kaizen": "INTEGER",
         "rate_shikaku": "REAL",
+        "kotsu_count": "INTEGER",
     })
+    _add_missing_columns(c, "work_data", {"kotsu_flags": "TEXT"})
     # 初期データ投入
     for k, v in DEFAULT_SETTINGS.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
@@ -163,7 +166,7 @@ def save_record(rec):
     rec.setdefault("created_at", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     cols = ["person", "period", "visits", "total_min", "body_min", "living_min",
             "training_min", "rate_training", "rate_living", "rate_body",
-            "amt_training", "amt_living", "amt_body", "kotsu", "shikaku",
+            "amt_training", "amt_living", "amt_body", "kotsu", "kotsu_count", "shikaku",
             "rate_shikaku", "other1", "other2", "rate_kaizen_living", "rate_kaizen_body",
             "amt_kaizen", "total_amount", "created_at"]
     conn = connect()
@@ -278,38 +281,65 @@ def save_work_data(person, period, rows):
     conn.close()
 
 
-def list_work_data():
-    """保存済み取込データの一覧(生データ含む)。"""
-    conn = connect()
-    rows = conn.execute(
-        "SELECT id,person,period,rows_json,updated_at FROM work_data "
-        "ORDER BY updated_at DESC, id DESC").fetchall()
-    conn.close()
-    out = []
-    for r in rows:
-        d = dict(r)
-        try:
-            d["rows"] = json.loads(d.pop("rows_json") or "[]")
-        except (ValueError, TypeError):
-            d["rows"] = []
-        out.append(d)
-    return out
-
-
-def get_work_data(wid):
-    conn = connect()
-    r = conn.execute(
-        "SELECT id,person,period,rows_json,updated_at FROM work_data WHERE id=?",
-        (wid,)).fetchone()
-    conn.close()
-    if not r:
-        return None
+def _row_to_work_data(r):
+    """work_data の1行を dict 化し、rows / kotsu_flags を JSON から復元する。"""
     d = dict(r)
     try:
         d["rows"] = json.loads(d.pop("rows_json") or "[]")
     except (ValueError, TypeError):
         d["rows"] = []
+    try:
+        flags = json.loads(d.pop("kotsu_flags") or "null")
+    except (ValueError, TypeError):
+        flags = None
+    d["kotsu_flags"] = flags if isinstance(flags, list) else None
     return d
+
+
+def list_work_data():
+    """保存済み取込データの一覧(生データ・交通費フラグ含む)。"""
+    conn = connect()
+    rows = conn.execute(
+        "SELECT id,person,period,rows_json,kotsu_flags,updated_at FROM work_data "
+        "ORDER BY updated_at DESC, id DESC").fetchall()
+    conn.close()
+    return [_row_to_work_data(r) for r in rows]
+
+
+def get_work_data(wid):
+    conn = connect()
+    r = conn.execute(
+        "SELECT id,person,period,rows_json,kotsu_flags,updated_at FROM work_data "
+        "WHERE id=?", (wid,)).fetchone()
+    conn.close()
+    return _row_to_work_data(r) if r else None
+
+
+def get_kotsu_flags(person, period):
+    """person+period の交通費あり/なし手動設定を返す(未設定なら None)。"""
+    conn = connect()
+    r = conn.execute(
+        "SELECT kotsu_flags FROM work_data WHERE person=? AND period=?",
+        (person, period)).fetchone()
+    conn.close()
+    if not r or not r["kotsu_flags"]:
+        return None
+    try:
+        flags = json.loads(r["kotsu_flags"])
+    except (ValueError, TypeError):
+        return None
+    return flags if isinstance(flags, list) else None
+
+
+def save_kotsu_flags(person, period, flags):
+    """交通費のあり/なし手動設定(訪問ごとの True/False/None のリスト)を保存する。"""
+    payload = json.dumps(flags, ensure_ascii=False)
+    conn = connect()
+    conn.execute(
+        "UPDATE work_data SET kotsu_flags=? WHERE person=? AND period=?",
+        (payload, person, period))
+    conn.commit()
+    conn.close()
 
 
 def delete_work_data(wid):
