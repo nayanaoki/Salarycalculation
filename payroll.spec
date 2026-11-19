@@ -11,7 +11,7 @@ binaries = []
 hiddenimports = []
 
 # reportlab(CIDフォントデータ)・openpyxl・certifi(CA証明書) を確実に同梱する
-for pkg in ("reportlab", "openpyxl", "certifi"):
+for pkg in ("reportlab", "openpyxl", "certifi", "pypdf"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

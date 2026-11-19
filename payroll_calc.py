@@ -1,357 +1,230 @@
 # -*- coding: utf-8 -*-
-"""勤務実績(Excel)の集計・給与計算ロジック。"""
+"""職種ごとの計算を1つの入口にまとめる（給与計算タブはここだけを呼ぶ）。
+
+  - 介護            → calc_kaigo（区分・内容／身体分・生活分／按分）
+  - 看護師・准看・PT → calc_nurse（サービス内容／規定時間／★同行）
+
+実績の行は、どの職種でも 8 列にそろえて持つ（日付・曜日・開始・終了・分・利用者名
+までは共通。7・8 列目は 介護＝区分・内容／訪問看護＝サービス内容・備考）。
+同じ行でも職種によって読み方が変わるため、計算には必ず職種を渡す。
+
+金額は職種によらず次の式で組み立てる（使わない時間は 0 なので結果は統合前と同じ）:
+  基本給   = 身体分×身体時給 + 生活分×生活時給 + 訪問分×訪問時給 + 同行分×研修時給
+  処遇改善 = 身体分×(身体) + 生活分×(生活) + 訪問分×(訪問)    ※同行は対象外
+  資格手当 = (身体分+生活分+訪問分) × 円/時                   ※同行は対象外
+"""
 import re
-from collections import defaultdict
+from collections import Counter
 
-# 列インデックス (0始まり): A実施日 B曜日 C開始 D終了 E時間 F利用者名 G区分 H内容
-COL_DATE, COL_DOW, COL_START, COL_END, COL_DUR, COL_USER, COL_KUBUN, COL_SERVICE = range(8)
-HEADER_ROWS = 2
+import jobs
+import calc_kaigo as kaigo
+import calc_nurse as nurse
+
+# 列の位置（日付〜利用者名は全職種で共通）
+COL_DATE, COL_DOW, COL_START, COL_END, COL_DUR, COL_USER = range(6)
+NCOLS = nurse.NCOLS
+
+# 共通の道具（日付・行の整形・対象月）
+clean_row = nurse.clean_row
+parse_date = nurse.parse_date
+month_of = nurse.month_of
+filter_month = nurse.filter_month
+main_month = nurse.main_month
+is_data_row = nurse.is_data_row
+sheet_rows = nurse.sheet_rows
+parse_minutes = nurse.parse_minutes
+parse_pasted = nurse.parse_pasted
+normalize_service = nurse.normalize_service
+yen = nurse.yen
 
 
-def _to_minutes_of_day(cell):
-    """時刻セルを 0時からの分に変換。datetime.time / 'H:MM' 文字列に対応。"""
-    if cell is None:
-        return None
-    hour = getattr(cell, "hour", None)
-    if hour is not None:
-        return hour * 60 + getattr(cell, "minute", 0)
-    m = re.match(r"\s*(\d{1,2})\s*[:：]\s*(\d{1,2})", str(cell))
-    if m:
-        return int(m.group(1)) * 60 + int(m.group(2))
+# ---------------------------------------------------------------- 職種の自動判定
+_KAIGO_KUBUN = {"介護予防", "同行", "家事", "身体介護", "身体生活", "生活援助", "生活"}
+_KAIGO_NAIYOU = re.compile(r"^(身体|生活|身[0-9０-９]|家事|訪問型独自)")
+_LPN = re.compile(r"准")
+_PT = re.compile(r"Ⅰ[５5]|理学|作業療法|言語聴覚")
+_NURSE = re.compile(r"訪看Ⅰ[１-４1-4]|正看")
+
+
+def _vote(row):
+    """1行から職種の手がかりを読む（決め手が無い行は None）。"""
+    c7 = str(row[6] or "").strip()          # 介護=区分 / 訪問看護=サービス内容
+    c8 = str(row[7] or "").strip()          # 介護=内容 / 訪問看護=備考
+    s = normalize_service(c7)
+    if _LPN.search(s):
+        return jobs.LPN
+    if _PT.search(s):
+        return jobs.PT
+    if _NURSE.search(s):
+        return jobs.NURSE
+    if c7 in _KAIGO_KUBUN or _KAIGO_NAIYOU.match(c8):
+        return jobs.KAIGO
     return None
 
 
-def parse_minutes(dur_cell, start_cell, end_cell):
-    """列E(例 '75分')から分。無ければ開始/終了から算出。
+def detect_job(rows):
+    """実績の中身から職種を推定する。
 
-    Excel読込では時刻は datetime.time、貼り付けでは 'H:MM' 文字列になるため
-    どちらでも算出できるようにする。
+    戻り: (職種キー or None, 説明文)。行ごとの手がかりで多数決をとり、
+    同数や手がかりなし（定期巡回だけ等）のときは None。
     """
-    if dur_cell is not None and str(dur_cell).strip() != "":
-        m = re.search(r"(\d+)", str(dur_cell))
-        if m:
-            return int(m.group(1))
-    s = _to_minutes_of_day(start_cell)
-    e = _to_minutes_of_day(end_cell)
-    if s is not None and e is not None and e >= s:
-        return e - s
-    return 0
-
-
-def is_plain_body(service):
-    """番号なしの「身体」かどうか。
-
-    「身体１・Ⅱ」「身体2」など番号付きは対応表の固定値で計算するため除外し、
-    番号の付かない「身体」「身体・Ⅱ」等のみ実時間計算の対象とする。
-    """
-    return bool(re.match(r"^身体(?![0-9０-９])", service))
-
-
-def apportion_service(body, living, minutes):
-    """対応表(身体分,生活分)と実提供分から、実際に計上する(身体,生活)分を返す。
-
-    身体分+生活分 をそのサービス内容の「規定提供時間」とみなす。
-    実提供時間(minutes)が規定提供時間未満のときは、身体:生活の比率を保ったまま
-    実提供時間を按分する（例: 身1生1=30+20=50分・比率60%:40%、実45分なら身27/生18）。
-    実提供時間が規定以上のとき、または比率が定まらない/時間不明のときは固定値を用いる。
-
-    戻り: (body_min, living_min, adjusted)  adjusted=按分したか
-    """
-    body = int(body or 0)
-    living = int(living or 0)
-    kitei = body + living
-    if kitei > 0 and minutes and 0 < minutes < kitei:
-        b = int(round(minutes * body / kitei))
-        l = minutes - b            # 合計が実提供時間と一致するよう残りを生活へ
-        return b, l, True
-    return body, living, False
-
-
-def _kotsu_auto_flags(visit_times, first_included):
-    """各訪問が交通費対象かどうかの自動判定を bool リストで返す。
-
-    visit_times: [(日キー, 開始分, 終了分), ...] 全訪問分（元の並び順）。
-    戻りは visit_times と同じ並び順の bool リスト。
-    - 直前サービスの終了時刻と当該サービスの開始時刻が同じ時刻なら、移動が無い
-      ものとして交通費対象外にする（選択式ではなく全利用者共通）。
-    - first_included=False のとき、各日の最初の1件を交通費対象外にする。
-    日ごとに開始時刻順へ並べ替えて隣接判定する。
-    """
-    by_day = defaultdict(list)
-    for order, (day, s, e) in enumerate(visit_times):
-        by_day[day].append((s, e, order))
-    flags = [False] * len(visit_times)
-    for items in by_day.values():
-        # 開始時刻順(不明は末尾)。同時刻は元の並び順で安定化。
-        items.sort(key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0, t[2]))
-        prev_end = None
-        for i, (s, e, order) in enumerate(items):
-            chargeable = True
-            if i == 0 and not first_included:
-                chargeable = False            # その日の1件目は対象外
-            elif i > 0 and s is not None and prev_end is not None and s == prev_end:
-                chargeable = False            # 前サービス終了＝開始 → 移動なし
-            flags[order] = chargeable
-            prev_end = e
-    return flags
-
-
-def apply_kotsu_overrides(auto_flags, overrides):
-    """自動判定(auto_flags)に手動の交通費あり/なし(overrides)を上書きした結果を返す。
-
-    overrides は各訪問に対応するリスト。要素が True/False なら強制的にその値を、
-    None（または範囲外・未指定）なら自動判定をそのまま用いる。
-    """
-    result = []
-    for i, auto in enumerate(auto_flags):
-        ov = overrides[i] if overrides and i < len(overrides) else None
-        result.append(auto if ov is None else bool(ov))
-    return result
-
-
-def _kotsu_count(visit_times, first_included, overrides=None):
-    """交通費を支給する件数を求める（手動上書きがあれば反映）。"""
-    flags = apply_kotsu_overrides(
-        _kotsu_auto_flags(visit_times, first_included), overrides)
-    return sum(1 for f in flags if f)
-
-
-def is_data_row(row):
-    """勤務実績の「データ行」らしいかどうか。
-
-    データ行は実施日(先頭列)に日付の数字を持ち、開始/終了/時間のいずれかに
-    時刻・時間がある。見出し行(「実施日」「曜日」…)やタイトル行(「◯年◯月度」等)は
-    実施日に数字が無い、あるいは時刻が無いため False になる。
-    """
-    if not row or len(row) <= COL_SERVICE:
-        return False
-    date = row[COL_DATE]
-    if date is None or not re.search(r"\d", str(date)):
-        return False
-    return (_to_minutes_of_day(row[COL_START]) is not None
-            or _to_minutes_of_day(row[COL_END]) is not None
-            or parse_minutes(row[COL_DUR], row[COL_START], row[COL_END]) > 0)
-
-
-def sheet_rows(ws):
-    """1シートから先頭の見出し行を除いたデータ行(タプルの並び)を返す。
-
-    見出し行の数はExcelによって異なる（0〜2行など）。先頭から最初の
-    「データ行」までを見出しとみなして自動的に読み飛ばす。これにより
-    見出しが無いExcel（1行目からデータ）でも全件を取り込める。
-    """
-    rows = list(ws.iter_rows(values_only=True))
-    for i, row in enumerate(rows):
-        if is_data_row(row):
-            return rows[i:]
-    # データ行が判定できないときは従来どおり固定の見出し行数で切る（保険）
-    return rows[HEADER_ROWS:]
-
-
-def calc_sheet(ws, mapping, kotsu_first_included=True, kotsu_overrides=None):
-    """1シート(=人物1人)を集計。mapping: {service:(body,living)}"""
-    return calc_rows(sheet_rows(ws), mapping, kotsu_first_included, kotsu_overrides)
-
-
-def calc_rows(rows, mapping, kotsu_first_included=True, kotsu_overrides=None):
-    """行タプルの並び(=人物1人)を集計。mapping: {service:(body,living)}
-
-    rows は各要素が少なくとも COL_SERVICE(8列)まで持つタプル/リスト。
-    Excelシート・貼り付けデータのどちらからでも同じロジックで集計する。
-    kotsu_first_included=False のとき、各日の最初の1件を交通費対象外にする。
-    kotsu_overrides は各訪問(visit)の交通費あり/なしを手動で上書きするリスト
-    （True/False/None、訪問と同じ並び順）。
-    """
-    body_min = living_min = training_min = 0
-    visits = 0
-    apportioned = 0
-    errors = []
-    visit_times = []                       # 交通費件数の判定用 (日,開始分,終了分)
-    for row in rows:
-        if not row or len(row) <= COL_SERVICE or row[COL_DATE] in (None, ""):
+    votes = Counter()
+    for r in rows or []:
+        r = clean_row(r)
+        if r[COL_DATE] in (None, ""):
             continue
-        kubun = row[COL_KUBUN] or ""
-        service = row[COL_SERVICE] or ""
-        if isinstance(kubun, str):
-            kubun = kubun.strip()
-        if isinstance(service, str):
-            service = service.strip()
-        minutes = parse_minutes(row[COL_DUR], row[COL_START], row[COL_END])
-        visits += 1
-        visit_times.append((str(row[COL_DATE]),
-                            _to_minutes_of_day(row[COL_START]),
-                            _to_minutes_of_day(row[COL_END])))
-
-        if kubun == "同行":
-            training_min += minutes        # 同行 → 実時間を研修時給
-        elif service == "家事":
-            living_min += minutes          # 家事 → 実時間を生活時給
-        elif is_plain_body(service):
-            body_min += minutes            # 番号なし「身体」→ 実時間を身体時給
-        elif service in mapping:
-            # 対応表 → 規定提供時間(身体+生活)。実提供時間が規定未満なら按分。
-            b, l = mapping[service]
-            b, l, adj = apportion_service(b, l, minutes)
-            body_min += b
-            living_min += l
-            if adj:
-                apportioned += 1
-        else:
-            errors.append(service)         # 対応表外 → エラー(計算しない)
-
-    return {
-        "visits": visits,
-        "kotsu_count": _kotsu_count(visit_times, kotsu_first_included, kotsu_overrides),
-        "apportioned": apportioned,
-        "body_min": body_min,
-        "living_min": living_min,
-        "training_min": training_min,
-        "total_min": body_min + living_min + training_min,
-        "errors": errors,
-    }
+        v = _vote(r)
+        if v:
+            votes[v] += 1
+    if not votes:
+        return None, "実績から職種を判定できませんでした"
+    (top, n), *rest = votes.most_common()
+    if rest and rest[0][1] == n:
+        return None, "実績に複数の職種の記録が同じ数ずつあります"
+    total = sum(votes.values())
+    return top, f"実績から判定（{total}件中{n}件が{jobs.label(top)}の記録）"
 
 
-def row_detail(row, mapping):
-    """1行を労働記録(勤務実績)出力用に分解する。空行なら None。
+# ---------------------------------------------------------------- 集計
+_EMPTY = {"visits": 0, "kotsu_count": 0, "total_min": 0, "training_min": 0,
+          "body_min": 0, "living_min": 0, "visit_min": 0, "units": 0,
+          "slots": {}, "real_count": 0, "apportioned": 0, "errors": []}
 
-    戻り: dict(date,dow,user,service,start,end,minutes,body,living,training,error)
-    区分・内容の判定は calc_rows と同じ（同行→研修/家事→生活/番号なし身体→身体/
-    対応表→固定分数/それ以外→error）。
-    """
-    if not row or len(row) <= COL_SERVICE or row[COL_DATE] in (None, ""):
-        return None
-    kubun = row[COL_KUBUN] or ""
-    service = row[COL_SERVICE] or ""
-    if isinstance(kubun, str):
-        kubun = kubun.strip()
-    if isinstance(service, str):
-        service = service.strip()
-    minutes = parse_minutes(row[COL_DUR], row[COL_START], row[COL_END])
-    body = living = training = 0
-    error = False
-    adjusted = False
-    if kubun == "同行":
-        training = minutes
-    elif service == "家事":
-        living = minutes
-    elif is_plain_body(service):
-        body = minutes
-    elif service in mapping:
-        b, l = mapping[service]
-        body, living, adjusted = apportion_service(b, l, minutes)
+
+def calc_rows(job, rows, mapping, kotsu_first_included=True, kotsu_overrides=None,
+              use_kitei=True):
+    """1人分を職種のきまりで集計する。キーは全職種で同じ（使わないものは 0）。"""
+    rows = [clean_row(r) for r in rows]
+    out = dict(_EMPTY, slots={}, errors=[])
+    if job == jobs.KAIGO:
+        r = kaigo.calc_rows(rows, mapping, kotsu_first_included, kotsu_overrides)
+    elif jobs.is_nursing(job):
+        r = nurse.calc_rows(rows, mapping, kotsu_first_included, kotsu_overrides,
+                            use_kitei=use_kitei, unit_min=jobs.unit_min(job))
     else:
-        error = True
+        return out
+    out.update(r)
+    out["errors"] = [str(s).strip() or "（空欄）" for s in out["errors"]]
+    out["total_min"] =(out["body_min"] + out["living_min"] + out["visit_min"]
+                        + out["training_min"])
+    return out
+
+
+def _kaigo_kind(d):
+    if d["error"]:
+        return "対応表外"
+    if d["training"]:
+        return "同行"
+    parts = []
+    if d["body"]:
+        parts.append(f"身{d['body']}")
+    if d["living"]:
+        parts.append(f"生{d['living']}")
+    text = "・".join(parts) or "-"
+    return text + ("（按分）" if d.get("adjusted") else "")
+
+
+def visit_details(job, rows, mapping, kotsu_first_included=True, kotsu_overrides=None,
+                  use_kitei=True):
+    """訪問を1件ずつ明細化する（労働記録タブ・勤務実績PDF用）。
+
+    共通キー: date/dow/user/service/start/end/minutes/training/pay/error/label/
+              visit_index/kotsu_auto/kotsu（介護は body/living/adjusted も持つ）
+    """
+    rows = [clean_row(r) for r in rows]
+    if job == jobs.KAIGO:
+        details = kaigo.visit_details(rows, mapping, kotsu_first_included,
+                                      kotsu_overrides)
+        for d in details:
+            d["pay"] = d["body"] + d["living"]
+            d["label"] = _kaigo_kind(d)
+        return details
+    if jobs.is_nursing(job):
+        details = nurse.visit_details(rows, mapping, kotsu_first_included,
+                                      kotsu_overrides, use_kitei=use_kitei)
+        for d in details:
+            if d["error"]:
+                d["label"] = "対応表外"
+            elif d["training"]:
+                d["label"] = f"同行 {d['training']}分"
+            elif d["kind"] == "実時間":
+                d["label"] = f"実時間 {d['pay']}分"
+            else:
+                d["label"] = d["kind"] or "-"
+        return details
+    return []
+
+
+def slot_text(res, job):
+    """訪問看護の時間の内訳（「30分×12 / 実時間×3」）。介護は空。"""
+    if not jobs.is_nursing(job):
+        return ""
+    return nurse.slot_text(res, jobs.unit_min(job))
+
+
+# ---------------------------------------------------------------- 金額
+def amounts(res, rates, kotsu_unit):
+    """集計結果と単価 → 各項目の金額。"""
+    g = lambda k: float(rates.get(k) or 0)    # noqa: E731
+    kotsu_count = res.get("kotsu_count", res["visits"])
     return {
-        "date": row[COL_DATE], "dow": row[COL_DOW], "user": row[COL_USER],
-        "service": service, "start": row[COL_START], "end": row[COL_END],
-        "minutes": minutes, "body": body, "living": living,
-        "training": training, "error": error, "adjusted": adjusted,
+        "amt_training": yen(res["training_min"], g("training")),
+        "amt_body": yen(res["body_min"], g("body")),
+        "amt_living": yen(res["living_min"], g("living")),
+        "amt_visit": yen(res["visit_min"], g("visit")),
+        "amt_kaizen": (yen(res["body_min"], g("kaizen_body"))
+                       + yen(res["living_min"], g("kaizen_living"))
+                       + yen(res["visit_min"], g("kaizen"))),
+        "kotsu_count": kotsu_count,
+        "kotsu": int(round(kotsu_count * float(kotsu_unit or 0))),
     }
 
 
-def visit_details(rows, mapping, kotsu_first_included=True, kotsu_overrides=None):
-    """労働記録の訪問(visit)を1件ずつ明細化し、交通費の対象/対象外も付ける。
-
-    戻り: list of dict。row_detail の各キーに加え
-      - visit_index: 訪問の連番(0始まり)
-      - kotsu_auto:  自動判定での交通費対象か
-      - kotsu:       手動上書きを反映した最終的な交通費対象か
-    calc_rows と同じ並び順・同じ判定なので、visit_index はそのまま
-    kotsu_overrides の添字として使える。
-    """
-    details = []
-    visit_times = []
-    for row in rows:
-        d = row_detail(row, mapping)
-        if d is None:
-            continue
-        visit_times.append((str(row[COL_DATE]),
-                            _to_minutes_of_day(row[COL_START]),
-                            _to_minutes_of_day(row[COL_END])))
-        details.append(d)
-    auto = _kotsu_auto_flags(visit_times, kotsu_first_included)
-    final = apply_kotsu_overrides(auto, kotsu_overrides)
-    for i, d in enumerate(details):
-        d["visit_index"] = i
-        d["kotsu_auto"] = auto[i] if i < len(auto) else False
-        d["kotsu"] = final[i] if i < len(final) else False
-    return details
+def shikaku_minutes(res):
+    """資格手当の対象時間（同行を除く）。"""
+    return res["body_min"] + res["living_min"] + res["visit_min"]
 
 
-def parse_pasted(text):
-    """Excelから貼り付けたタブ区切りテキストを行タプルの並びに変換。
-
-    見出し行(実施日など日付でない行)や空行は自動的に読み飛ばす。
-    A実施日 B曜日 C開始 D終了 E時間 F利用者名 G区分 H内容 の並びを想定。
-    """
-    rows = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        cells = line.split("\t")
-        # 8列に満たない貼り付けにも耐えるようパディング
-        if len(cells) < COL_SERVICE + 1:
-            cells = cells + [""] * (COL_SERVICE + 1 - len(cells))
-        cells = [c.strip() for c in cells]
-        # 実施日に数字が無い行(見出し・注記など)は読み飛ばす
-        if not re.search(r"\d", cells[COL_DATE] or ""):
-            continue
-        rows.append(tuple(cells))
-    return rows
+def calc_shikaku(res, rate):
+    return yen(shikaku_minutes(res), float(rate or 0))
 
 
-def yen(minutes, rate):
-    """分 ÷ 60 × 時給 (四捨五入)。"""
-    return int(round(minutes / 60.0 * rate))
-
-
-def calc_kaizen(res, rates):
-    """処遇改善手当 = 生活時間×(生活/時間) + 身体時間×(身体/時間)。"""
-    return (yen(res["living_min"], rates.get("kaizen_living", 0))
-            + yen(res["body_min"], rates.get("kaizen_body", 0)))
-
-
-def calc_shikaku(res, shikaku_rate):
-    """資格手当 = (身体+生活)時間 × 1時間あたりの支給額(四捨五入)。
-
-    研修時給が適用される時間(同行)は資格手当の対象外とするため、
-    total_min ではなく body_min + living_min で計算する。
-    """
-    return yen(res["body_min"] + res["living_min"], float(shikaku_rate or 0))
-
-
-def build_record(person, period, res, rates, kotsu_unit,
+def build_record(job, person, period, res, rates, kotsu_unit,
                  shikaku_rate=0, other1=0, other2=0):
-    """集計結果と各種単価から1人分の給与レコードを組み立てる。
-
-    shikaku_rate は資格手当の「1時間あたりの支給額」。稼働時間に応じて
-    自動計算し、金額(shikaku)を求める。
-    """
-    amt_training = yen(res["training_min"], rates["training"])
-    amt_living = yen(res["living_min"], rates["living"])
-    amt_body = yen(res["body_min"], rates["body"])
-    amt_kaizen = calc_kaizen(res, rates)
-    kotsu_count = res.get("kotsu_count", res["visits"])
-    kotsu = int(round(kotsu_count * kotsu_unit))
+    """集計結果と単価から1人分の給与レコードを組み立てる（全職種共通の形）。"""
+    a = amounts(res, rates, kotsu_unit)
     shikaku_rate = float(shikaku_rate or 0)
     shikaku = calc_shikaku(res, shikaku_rate)
     other1 = int(other1 or 0)
     other2 = int(other2 or 0)
-    total = (amt_training + amt_living + amt_body + amt_kaizen
-             + kotsu + shikaku + other1 + other2)
+    total = (a["amt_training"] + a["amt_body"] + a["amt_living"] + a["amt_visit"]
+             + a["amt_kaizen"] + a["kotsu"] + shikaku + other1 + other2)
+    g = lambda k: float(rates.get(k) or 0)    # noqa: E731
     return {
-        "person": person, "period": period,
-        "visits": res["visits"], "kotsu_count": kotsu_count,
-        "total_min": res["total_min"],
+        "job": job, "person": person, "period": period,
+        "visits": res["visits"], "kotsu_count": a["kotsu_count"],
+        "total_min": res["total_min"], "training_min": res["training_min"],
         "body_min": res["body_min"], "living_min": res["living_min"],
-        "training_min": res["training_min"],
-        "rate_training": rates["training"], "rate_living": rates["living"],
-        "rate_body": rates["body"],
-        "rate_kaizen_living": rates.get("kaizen_living", 0),
-        "rate_kaizen_body": rates.get("kaizen_body", 0),
-        "amt_training": amt_training, "amt_living": amt_living, "amt_body": amt_body,
-        "amt_kaizen": amt_kaizen,
-        "kotsu": kotsu, "rate_shikaku": shikaku_rate, "shikaku": shikaku,
-        "other1": other1, "other2": other2,
-        "total_amount": total,
+        "visit_min": res["visit_min"], "units": res.get("units", 0),
+        "rate_training": g("training"), "rate_body": g("body"),
+        "rate_living": g("living"), "rate_visit": g("visit"),
+        "rate_kaizen": g("kaizen"), "rate_kaizen_body": g("kaizen_body"),
+        "rate_kaizen_living": g("kaizen_living"),
+        "amt_training": a["amt_training"], "amt_body": a["amt_body"],
+        "amt_living": a["amt_living"], "amt_visit": a["amt_visit"],
+        "amt_kaizen": a["amt_kaizen"], "kotsu": a["kotsu"],
+        "rate_shikaku": shikaku_rate, "shikaku": shikaku,
+        "other1": other1, "other2": other2, "total_amount": total,
     }
+
+
+def base_pay(rec):
+    """基本給（身体・生活・訪問。同行は別）。総計の表で使う。"""
+    return (rec.get("amt_body") or 0) + (rec.get("amt_living") or 0) \
+        + (rec.get("amt_visit") or 0)
+
+
+def extra_pay(rec):
+    """手当等（処遇改善・資格手当・その他）。"""
+    return ((rec.get("amt_kaizen") or 0) + (rec.get("shikaku") or 0)
+            + (rec.get("other1") or 0) + (rec.get("other2") or 0))

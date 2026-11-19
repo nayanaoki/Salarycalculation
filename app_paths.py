@@ -10,6 +10,22 @@ import shutil
 
 APP_NAME = "給与自動計算"
 
+# 訪問看護給与（職種ごとの別アプリ）のデータ置き場。v1.4.0 の初回起動時に取り込む。
+LEGACY_APPS = {
+    "nurse": "訪問看護給与_看護師",
+    "lpn": "訪問看護給与_准看護師",
+    "pt": "訪問看護給与_理学療法士",
+}
+
+
+def legacy_db_path(job):
+    """訪問看護給与アプリの payroll.db（無ければ None）。"""
+    if job not in LEGACY_APPS:
+        return None
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    p = os.path.join(base, LEGACY_APPS[job], "payroll.db")
+    return p if os.path.exists(p) else None
+
 
 def is_frozen():
     """PyInstaller などで exe 化されているか。"""
