@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-"""「職員別スケジュール表(実績)」PDF の読み取り。
+"""実績 PDF の読み取り（1ファイル＝職員1人）。2つの書式に対応する。
 
-訪問看護ソフトが出力する PDF（1ファイル＝職員1人）から、
+  - 訪問看護「職員別スケジュール表(実績)」: 職員名・サービス内容（★=同行）
+  - 訪問介護「ヘルパー別シフト表（実績）」: ヘルパー名・サービス内容（★=同行）
+    → 介護の勤務実績 Excel と同じ並び（G区分・H内容）に直して返す
+
 職員名・対象期間・訪問の明細を取り出す。
 
 PDF の文字を行ごとに読むと、サービス内容や備考の折り返し（例「精神基本療養費Ⅰ・正／看」）
@@ -16,7 +19,8 @@ import pypdf
 import payroll_calc as calc
 
 _DATE = re.compile(r"^(\d{1,2})月(\d{1,2})日\s*[（(]([月火水木金土日])[）)]")
-_TIME = re.compile(r"^\d{1,2}:\d{2}$")
+_TIME = re.compile(r"\d{1,2}:\d{2}")     # 「09:30 ～ 10:30」と1つの文字列のこともある
+_PERSON = re.compile(r"^(職員名|ヘルパー名)\s*[:：]\s*")
 _ERA = re.compile(r"令和\s*(\d+)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 
 # 列の境界（実物の PDF で計測。各列の文字は列の左端から書き始められる）
@@ -82,13 +86,40 @@ def _header_info(frags):
     joined = [" ".join(t for _x, t in sorted(v)) for _y, v in sorted(lines.items(), reverse=True)]
     person = office = period = ""
     for s in joined:
-        if s.startswith("職員名") and not person:
-            person = re.sub(r"^職員名\s*[:：]\s*", "", s).strip()
+        if _PERSON.match(s) and not person:
+            person = _PERSON.sub("", s).strip()
         elif s.startswith("事業所名") and not office:
             office = re.sub(r"^事業所名\s*[:：]\s*", "", s).strip()
         elif s.startswith("対象期間") and not period:
             period = re.sub(r"^対象期間\s*[:：]\s*", "", s).strip()
     return person, office, period
+
+
+def _is_kaigo_sheet(frags):
+    """訪問介護の「ヘルパー別シフト表」か（見出しに「ヘルパー」がある）。"""
+    return any("ヘルパー別" in t or t.startswith("ヘルパー名") for _x, _y, t in frags)
+
+
+def _kaigo_kubun(naiyou, doukou):
+    """介護の内容から、勤務実績 Excel の G区分 に当たる言葉を作る。
+
+    計算で意味を持つのは「同行」だけ（同行→研修時給）。他は表示用。
+    """
+    if doukou:
+        return "同行"
+    if naiyou == "家事":
+        return "家事"
+    if naiyou.startswith("訪問型"):
+        return "介護予防"
+    if re.match(r"^身\S*生", naiyou):
+        return "身体生活"
+    if naiyou.startswith("生活"):
+        return "生活"
+    if naiyou == "身体":
+        return "身体"
+    if naiyou.startswith("身体"):
+        return "身体介護"
+    return ""
 
 
 def _start_year(period_text):
@@ -110,10 +141,12 @@ def read(path):
 
     person = office = period_text = ""
     rows = []
+    kaigo = False
     for page in reader.pages:
         frags = _fragments(page)
         if not frags:
             continue
+        kaigo = kaigo or _is_kaigo_sheet(frags)
         p, o, per = _header_info(frags)
         person = person or p
         office = office or o
@@ -149,8 +182,8 @@ def read(path):
         for y, date_text, cols in sorted(anchors, key=lambda a: -a[0]):
             def joined(col, sep=""):
                 return sep.join(t for _ny, _x, t in sorted(cols[col]))
-            times = [t for _ny, _x, t in sorted(cols["time"], key=lambda v: v[1])
-                     if _TIME.match(t)]
+            times = [hm for _ny, _x, t in sorted(cols["time"], key=lambda v: v[1])
+                     for hm in _TIME.findall(t)]
             m = _DATE.match(date_text)
             rows.append({
                 "month": int(m.group(1)), "day": int(m.group(2)), "dow": m.group(3),
@@ -164,7 +197,8 @@ def read(path):
 
     if not rows:
         raise ScheduleError("訪問の明細が見つかりませんでした。"
-                            "「職員別スケジュール表(実績)」のPDFか確認してください。")
+                            "「職員別スケジュール表(実績)」または"
+                            "「ヘルパー別シフト表（実績）」のPDFか確認してください。")
 
     # 3) 年を付ける。対象期間の開始年から、月が戻ったら翌年とみなす。
     year, start_month = _start_year(period_text)
@@ -179,7 +213,14 @@ def read(path):
             cur_year += 1
         prev_month = r["month"]
         date = f"{cur_year:04d}-{r['month']:02d}-{r['day']:02d}"
+        if kaigo:
+            # 介護の勤務実績 Excel と同じ並び: …利用者名・G区分・H内容
+            doukou = "★" in r["service"]
+            naiyou = re.sub(r"[\s　★]+", "", r["service"])
+            g, h = _kaigo_kubun(naiyou, doukou), naiyou
+        else:
+            g, h = r["service"], r["note"]
         out.append(calc.clean_row((date, r["dow"], r["start"], r["end"], r["dur"],
-                                   r["user"], r["service"], r["note"])))
+                                   r["user"], g, h)))
     return {"person": person, "office": office, "period_text": period_text,
-            "rows": out}
+            "rows": out, "kind": "kaigo" if kaigo else "nursing"}

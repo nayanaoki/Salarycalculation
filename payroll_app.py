@@ -475,8 +475,9 @@ class App(tk.Tk):
         c1, f1 = theme.card(setup)
         c1.pack(fill="x", pady=(12, 0))
         self._step_head(f1, "1", "実績を取り込む",
-                        "介護の勤務実績Excel（1シート＝1人）と、訪問看護の「職員別スケジュール表"
-                        "(実績)」PDF（1ファイル＝1人）を、まとめて選べます。"
+                        "介護の勤務実績Excel（1シート＝1人）、介護の「ヘルパー別シフト表（実績）」PDF、"
+                        "訪問看護の「職員別スケジュール表(実績)」PDF（PDFは1ファイル＝1人）を、"
+                        "まとめて選べます。"
                         "対象月以外の日付の行は除いて計算します。")
         row = ttk.Frame(f1)
         row.pack(fill="x", pady=(10, 0))
@@ -552,7 +553,7 @@ class App(tk.Tk):
         ttk.Label(inner, text="まだ計算結果がありません",
                   style="Head.TLabel").pack()
         ttk.Label(inner,
-                  text="上の「実績ファイルを選択」で介護のExcel・訪問看護のPDFを読み込むか、"
+                  text="上の「実績ファイルを選択」で実績のExcel・PDF（介護・訪問看護）を読み込むか、"
                        "「表を貼り付けて追加」で1人分を追加してください。\n"
                        "以前に取り込んだ分は「労働記録」タブから再読込できます。",
                   style="Muted.TLabel", justify="center").pack(pady=(8, 0))
@@ -632,7 +633,7 @@ class App(tk.Tk):
     def open_file(self, append=False):
         """実績ファイル（PDF・Excel）を読み込む。複数選択可・混在可。"""
         paths = filedialog.askopenfilenames(
-            title="実績ファイルを選択（介護のExcel・訪問看護のPDF。複数可）",
+            title="実績ファイルを選択（介護のExcel・PDF、訪問看護のPDF。複数可）",
             filetypes=[("実績（PDF・Excel）", "*.pdf *.xlsx *.xlsm"),
                        ("PDF", "*.pdf"), ("Excel", "*.xlsx *.xlsm"), ("すべて", "*.*")])
         if not paths:
